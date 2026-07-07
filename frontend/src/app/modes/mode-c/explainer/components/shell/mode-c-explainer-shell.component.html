@@ -1,0 +1,16 @@
+<div class="app-shell mode-c-shell">
+  <app-platform-topbar
+    modeLabel="模式 C"
+    modeTitle="CNN 卷积过程解释"
+    [statusPills]="statusPills"
+    [user]="user"
+    (logoutRequested)="requestLogout()"
+  />
+
+  <main class="mode-c-main">
+    <section class="workspace-stack">
+      <app-mode-c-overview />
+      <app-mode-c-detail-panel />
+    </section>
+  </main>
+</div>

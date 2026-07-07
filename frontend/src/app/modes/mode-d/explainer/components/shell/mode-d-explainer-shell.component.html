@@ -1,0 +1,19 @@
+<div class="app-shell mode-d-shell">
+  <app-platform-topbar
+    modeLabel="模式 D"
+    modeTitle="Transformer 下一词预测解释"
+    [statusPills]="statusPills"
+    [user]="user"
+    (logoutRequested)="requestLogout()"
+  />
+
+  <main class="mode-d-main">
+    <section class="workspace-grid">
+      <app-mode-d-input-panel />
+      <app-mode-d-topk-panel />
+      <app-mode-d-attention-matrix class="span-all" />
+      <app-mode-d-qkv-panel class="span-all" />
+      <app-mode-d-report-panel class="span-all" />
+    </section>
+  </main>
+</div>

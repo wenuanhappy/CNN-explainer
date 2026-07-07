@@ -1,0 +1,80 @@
+# See https://docs.github.com/get-started/getting-started-with-git/ignoring-files for more about ignoring files.
+
+# Compiled output
+/frontend/dist
+/tmp
+/out-tsc
+/bazel-out
+
+# Node
+/frontend/node_modules
+/frontend/.npm-cache/
+npm-debug.log
+yarn-error.log
+
+# IDEs and editors
+.idea/
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+
+# Visual Studio Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.history/*
+
+# Miscellaneous
+/frontend/.angular/cache
+.sass-cache/
+/connect.lock
+/coverage
+/libpeerconnection.log
+testem.log
+/typings
+__screenshots__/
+__pycache__/
+*.pyc
+
+# Spring backend local state
+backend/spring/target/
+backend/spring/.m2/
+backend/spring/data/
+backend/spring/datasets/
+backend/spring/logs/
+backend/spring/training-jobs/
+backend/spring/uploads/
+
+# Python forward backend local state
+backend/python-forward/.venv/
+backend/python-training/.venv/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Mode D / Transformer assets
+/frontend/public/mode-d-assets/model-v2/
+/frontend/public/mode-d-assets/article_assets/
+/frontend/public/mode-d-assets/preview/
+/frontend/public/mode-d-assets/vendor/
+!/frontend/public/mode-d-assets/README.md
+/frontend/public/mode-d-assets/models/Xenova/gpt2
+
+# Legacy local transformer asset mirrors
+/frontend/public/mode-d/
+/frontend/public/mode-f/
+
+transformer-explainer-upstream/
+
+*.tar
+*.gz
+*.zip
+gh-2.DCrB1VOc.js
+
+.tmp

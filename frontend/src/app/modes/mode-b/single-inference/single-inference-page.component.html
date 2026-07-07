@@ -1,0 +1,378 @@
+<div class="inference-shell">
+  <app-platform-topbar
+    modeLabel="B Mode"
+    modeTitle="单样本推理"
+    [statusPills]="topbarStatusPills"
+    [user]="authUser"
+    (logoutRequested)="logout()"
+  />
+
+  <div class="inference-workspace">
+    <aside class="inference-sidebar">
+      <a class="back-link" routerLink="/mode-b">返回 B 端训练</a>
+
+      <section class="panel">
+        <div class="panel-title" appTeachingTerm="checkpoint">Checkpoint</div>
+        @if (!authUser) {
+          <div class="empty-box">
+            <strong>需要登录</strong>
+            <span>登录后才能选择你保存过的 checkpoint。</span>
+            <a routerLink="/login">去登录</a>
+          </div>
+        } @else {
+          <button class="refresh-btn" (click)="loadCheckpoints()" [disabled]="loadingCheckpoints">
+            {{ loadingCheckpoints ? '加载中...' : '刷新 Checkpoint' }}
+          </button>
+          @if (completedCheckpoints.length) {
+            <div class="checkpoint-list-head">
+              <span>选择已完成训练</span>
+              <small>{{ completedCheckpoints.length }} 个 checkpoint</small>
+            </div>
+            <div class="checkpoint-option-list">
+              @for (checkpoint of completedCheckpoints; track checkpoint.id) {
+                <div
+                  class="checkpoint-option"
+                  role="button"
+                  tabindex="0"
+                  [class.active]="checkpoint.id === selectedCheckpoint?.id"
+                  [class.preview]="checkpoint.id === checkpointDetail?.id && checkpoint.id !== selectedCheckpoint?.id"
+                  (mouseenter)="previewCheckpoint(checkpoint.id, $event)"
+                  (focus)="previewCheckpoint(checkpoint.id, $event)"
+                  (mouseleave)="hideCheckpointPreview()"
+                  (blur)="hideCheckpointPreview()"
+                  (click)="selectCheckpoint(checkpoint.id)"
+                  (keydown.enter)="selectCheckpoint(checkpoint.id)"
+                  (keydown.space)="selectCheckpoint(checkpoint.id)"
+                >
+                  <div class="checkpoint-option-main">
+                    <strong>{{ checkpoint.name }}</strong>
+                    <span>{{ checkpoint.datasetName }} · {{ checkpointCreatedText(checkpoint) }}</span>
+                  </div>
+                  <div class="checkpoint-option-metric">
+                    <span>{{ percent(checkpoint.testAccuracy) }}</span>
+                    <small>测试</small>
+                  </div>
+                </div>
+              }
+            </div>
+            @if (selectedCheckpoint; as checkpoint) {
+              <div class="checkpoint-card">
+                <strong>{{ checkpoint.name }}</strong>
+                <span>{{ checkpoint.datasetName }}</span>
+                <small appTeachingTerm="epoch">Epoch {{ checkpoint.epoch }} / {{ checkpoint.totalEpochs }}</small>
+                <small appTeachingTerm="accuracy">测试准确率 {{ percent(checkpoint.testAccuracy) }}</small>
+              </div>
+            }
+          } @else {
+            <div class="empty-box">
+              <strong>暂无已完成训练</strong>
+              <span>完成一次训练并保存 checkpoint 后，这里会出现可推理模型。</span>
+            </div>
+          }
+        }
+      </section>
+
+      <section class="panel">
+        <div class="panel-title" appTeachingTerm="single-sample-inference">样本</div>
+        <button class="primary-action" (click)="openSampleDialog()" [disabled]="!selectedCheckpoint || loadingSamples">
+          {{ selectedSample ? '重新选择样本' : '选择数据样本' }}
+        </button>
+        @if (selectedSample; as sample) {
+          <div class="sample-summary" [class.table-sample]="!sample.imageUrl">
+            @if (sample.imageUrl) {
+              <img [src]="sample.imageUrl" [alt]="sample.name || 'sample'" />
+            }
+            <div>
+              <strong>{{ sample.name || ('sample ' + sample.index) }}</strong>
+              <span>真实类别：{{ sample.trueLabel }}</span>
+              @if (sample.imageUrl) {
+                <small appTeachingTerm="shape">shape {{ shapeLabel(sample.shape) }}</small>
+              }
+              @if (!sample.imageUrl && hasRawData(sample)) {
+                <div class="summary-raw-list">
+                  @for (cell of rawPreviewRows(sample, 4); track cell.name) {
+                    <span>
+                      <b>{{ cell.name }}</b>
+                      <em>{{ cell.value || '空' }}</em>
+                    </span>
+                  }
+                </div>
+                <button type="button" class="text-detail-btn" (click)="openRawSampleDetail(sample, $event)">查看完整原始数据</button>
+              }
+            </div>
+          </div>
+        } @else {
+          <div class="muted">选择 checkpoint 后，从对应数据集中挑一条样本进行推理。</div>
+        }
+        <button class="run-btn" (click)="runInference()" [disabled]="!selectedCheckpoint || !selectedSample || inferring">
+          <span appTeachingTerm="single-sample-inference">{{ inferring ? '推理中...' : '开始单样本推理' }}</span>
+        </button>
+      </section>
+    </aside>
+
+    @if (checkpointDetailPosition) {
+      @if (checkpointDetail; as checkpoint) {
+        <div
+          class="checkpoint-detail-popout"
+          [style.left.px]="checkpointDetailPosition.left"
+          [style.top.px]="checkpointDetailPosition.top"
+        >
+          <header>
+            <div>
+              <span appTeachingTerm="checkpoint">Checkpoint 详情</span>
+              <strong>{{ checkpoint.name }}</strong>
+            </div>
+            <small>{{ checkpoint.datasetName }} · #{{ checkpoint.modelSignature.slice(0, 10) }}</small>
+          </header>
+          <div class="hover-metric-grid">
+            <div><span>训练</span><strong>{{ percent(checkpoint.trainAccuracy) }}</strong></div>
+            <div><span>验证</span><strong>{{ percent(checkpoint.valAccuracy) }}</strong></div>
+            <div><span>测试</span><strong>{{ percent(checkpoint.testAccuracy) }}</strong></div>
+          </div>
+          <div class="hover-detail-row">
+            <span appTeachingTerm="hyperparameter">超参数</span>
+            <strong>{{ checkpointConfigText(checkpoint) }}</strong>
+          </div>
+          <div class="hover-detail-row">
+            <span appTeachingTerm="dataset-split">数据划分</span>
+            <strong>{{ checkpointSplitText(checkpoint) }}</strong>
+          </div>
+          <div class="hover-layer-list">
+            <span>网络层</span>
+            <div>
+              @for (layerText of checkpointLayerPreview(checkpoint); track layerText) {
+                <em>{{ layerText }}</em>
+              }
+              @if (checkpointLayerMoreCount(checkpoint) > 0) {
+                <em>+ {{ checkpointLayerMoreCount(checkpoint) }} 层</em>
+              }
+            </div>
+          </div>
+        </div>
+      }
+    }
+
+    <main class="inference-main">
+      @if (error) {
+        <div class="error-box">{{ error }}</div>
+      }
+
+      <section class="result-band">
+        <div>
+          <div class="eyebrow">Single Sample Inference</div>
+          <h1>{{ selectedCheckpoint?.datasetName || '选择模型与样本' }}</h1>
+          <p>加载已完成 <span appTeachingTerm="checkpoint">checkpoint</span>，选择一条数据，观察真实模型<span appTeachingTerm="layer-activation">逐层产生激活</span>并输出预测结果。</p>
+        </div>
+        @if (inferenceResult; as result) {
+          <div [class]="result.prediction.correct ? 'prediction-card ok' : 'prediction-card bad'">
+            <span appTeachingTerm="single-sample-inference">预测结果</span>
+            <strong>{{ result.prediction.predictedLabel }}</strong>
+            <small><span appTeachingTerm="prediction-confidence">置信度 {{ percent(result.prediction.confidence) }}</span> · 真实 {{ result.prediction.trueLabel }}</small>
+          </div>
+        }
+      </section>
+
+      @if (inferenceResult; as result) {
+        <section class="activation-stage">
+          <header class="stage-head">
+            <div>
+              <div class="section-title" appTeachingTerm="layer-activation">逐层激活网络结构</div>
+              <span class="muted">当前层：{{ activeActivation?.layerName }} · <span appTeachingTerm="shape">{{ shapeLabel(activeActivation?.shape) }}</span></span>
+            </div>
+            <div class="stage-actions">
+              <button class="ghost-btn" (click)="startActivationPlayback()">播放</button>
+              <button class="ghost-btn" (click)="stopActivationPlayback()">暂停</button>
+            </div>
+          </header>
+
+          <div class="activation-flow">
+            @for (activation of result.activations; track activation.order; let last = $last) {
+              <button
+                class="activation-node"
+                [class.active]="activation.order === activeActivationOrder"
+                [class.passed]="activation.order < activeActivationOrder"
+                [style.--accent]="layerColor(activation.layerType)"
+                (click)="selectActivation(activation.order)"
+              >
+                <span class="node-icon">{{ layerIcon(activation.layerType) }}</span>
+                <strong>{{ activation.layerName }}</strong>
+                <small>{{ layerTypeLabel(activation.layerType) }}</small>
+                <em>{{ shapeLabel(activation.shape) }}</em>
+              </button>
+              @if (!last) {
+                <div class="activation-link">
+                  <span></span>
+                  <i></i>
+                  <i></i>
+                  <i></i>
+                </div>
+              }
+            }
+          </div>
+        </section>
+
+        <section class="detail-grid">
+          <article class="detail-panel">
+            <div class="section-title" appTeachingTerm="layer-activation">当前层激活</div>
+            @if (activeActivation; as activation) {
+              <div class="activation-meta">
+                <div><span>类型</span><strong>{{ layerTypeLabel(activation.layerType) }}</strong></div>
+                <div><span appTeachingTerm="shape">Shape</span><strong>{{ shapeLabel(activation.shape) }}</strong></div>
+                <div><span>Mean</span><strong>{{ activation.stats.mean | number:'1.4-4' }}</strong></div>
+                <div><span>Max</span><strong>{{ activation.stats.max | number:'1.4-4' }}</strong></div>
+                <div><span>Min</span><strong>{{ activation.stats.min | number:'1.4-4' }}</strong></div>
+                <div><span>非零比例</span><strong>{{ percent(activation.stats.nonZeroRatio) }}</strong></div>
+              </div>
+
+              @if (activation.preview.mode === 'image') {
+                <div class="channel-grid">
+                  @for (channel of activation.preview.channelPreviews ?? []; track channel.channel) {
+                    <div class="channel-card">
+                      <span>Channel {{ channel.channel }}</span>
+                      <div class="heatmap" [style.grid-template-columns]="'repeat(' + channel.width + ', 1fr)'">
+                        @for (value of channel.values; track $index) {
+                          <i [style.background]="'rgb(' + Math.round(18 + value * 28) + ',' + Math.round(72 + value * 150) + ',' + Math.round(128 + value * 90) + ')'"></i>
+                        }
+                      </div>
+                    </div>
+                  }
+                </div>
+              } @else {
+                <div class="vector-bars">
+                  @for (bar of activationBars(activation); track bar.index) {
+                    <div class="vector-row">
+                      <span>{{ bar.index }}</span>
+                      <b [style.width.%]="bar.width"></b>
+                      <em>{{ bar.value | number:'1.3-3' }}</em>
+                    </div>
+                  }
+                </div>
+              }
+            } @else {
+              <div class="muted">暂无激活数据。</div>
+            }
+          </article>
+
+          <article class="detail-panel">
+            <div class="section-title" appTeachingTerm="top-k">输出类别概率</div>
+            <div class="topk-list">
+              @for (item of result.prediction.topK; track item.index) {
+                <div class="topk-row" [class.winner]="item.index === result.prediction.predictedIndex">
+                  <span>{{ item.label }}</span>
+                  <div><b [style.width.%]="item.probability * 100"></b></div>
+                  <strong>{{ percent(item.probability) }}</strong>
+                </div>
+              }
+            </div>
+            <div class="sample-verdict">
+              <strong>{{ result.prediction.correct ? '预测正确' : '预测错误' }}</strong>
+              <span>样本 {{ result.sample.index }} 的真实类别是 {{ result.prediction.trueLabel }}，模型输出为 {{ result.prediction.predictedLabel }}。</span>
+            </div>
+          </article>
+        </section>
+      } @else {
+        <div class="empty-large">
+          <strong>等待推理</strong>
+          <span>选择已完成 checkpoint 和一条样本后，这里会展示逐层激活过程。</span>
+        </div>
+      }
+    </main>
+  </div>
+
+  @if (sampleDialogOpen) {
+    <div class="sample-modal-mask" (click)="sampleDialogOpen=false"></div>
+    <div class="sample-modal">
+      <header>
+        <div>
+          <strong>选择一条数据</strong>
+          <span>{{ selectedCheckpoint?.datasetName }} · {{ samples.length || 0 }} 条预览</span>
+        </div>
+        <button class="ghost-btn" (click)="sampleDialogOpen=false">关闭</button>
+      </header>
+      @if (loadingSamples) {
+        <div class="empty-large compact"><strong>正在加载样本...</strong></div>
+      } @else {
+        @if (samplePreviewKind === 'table' && samples.length) {
+          <div class="table-sample-list">
+            <div class="table-sample-head">
+              <span>样本</span>
+              <span>标签</span>
+              <span>原始数据预览</span>
+              <span></span>
+            </div>
+            @for (sample of samples; track sample.index) {
+              <div class="table-sample-row" [class.active]="sample.index === selectedSample?.index" (click)="chooseSample(sample)">
+                <strong>#{{ sample.index }}</strong>
+                <span class="label-pill">{{ sample.trueLabel }}</span>
+                <div class="raw-cell-grid">
+                  @for (cell of rawPreviewRows(sample, 6); track cell.name) {
+                    <span class="raw-cell" [title]="cell.name + ': ' + (cell.value || '空')">
+                      <b>{{ cell.name }}</b>
+                      <strong>{{ cell.value || '空' }}</strong>
+                    </span>
+                  }
+                </div>
+                <span class="table-row-actions">
+                  <button type="button" class="detail-pill" (click)="openRawSampleDetail(sample, $event)">详情</button>
+                  <button type="button" class="choose-pill" (click)="chooseSample(sample); $event.stopPropagation()">选择</button>
+                </span>
+              </div>
+            }
+          </div>
+        } @else {
+          <div class="sample-grid">
+            @for (sample of samples; track sample.index) {
+              <button class="sample-tile" [class.active]="sample.index === selectedSample?.index" (click)="chooseSample(sample)">
+                @if (sample.imageUrl) {
+                  <img [src]="sample.imageUrl" [alt]="sample.name || 'sample'" />
+                } @else {
+                  <div class="feature-thumb">
+                    @for (feature of sampleFeatureRows(sample, 12); track feature.label) {
+                      <i [style.height.%]="Math.min(100, Math.abs(feature.value) * 18 + 8)"></i>
+                    }
+                  </div>
+                }
+                <strong>{{ sample.name || ('sample ' + sample.index) }}</strong>
+                <span>{{ sample.trueLabel }}</span>
+                <small>{{ shapeLabel(sample.shape) }}</small>
+              </button>
+            }
+          </div>
+        }
+      }
+    </div>
+  }
+
+  @if (rawSampleDetail; as sample) {
+    <div class="raw-modal-mask" (click)="closeRawSampleDetail()"></div>
+    <div class="raw-modal">
+      <header>
+        <div>
+          <strong>样本 #{{ sample.index }} 原始数据</strong>
+          <span>真实类别：{{ sample.trueLabel }} · {{ rawDataRows(sample).length }} 列</span>
+        </div>
+        <button class="ghost-btn" (click)="closeRawSampleDetail()">关闭</button>
+      </header>
+      <div class="raw-detail-grid">
+        @for (cell of rawDataRows(sample); track cell.name) {
+          <div class="raw-detail-cell">
+            <span>{{ cell.name }}</span>
+            <strong>{{ cell.value || '空' }}</strong>
+          </div>
+        }
+      </div>
+      <footer>
+        <button class="primary-action" (click)="chooseSample(sample)">选择这条数据</button>
+      </footer>
+    </div>
+  }
+
+  <app-teaching-search-fab />
+
+  <app-llm-floating-assistant
+    title="AI 单样本推理助手"
+    [systemPrompt]="inferenceLlmSystemPrompt"
+    [contextProvider]="inferenceLlmContextProvider"
+    [quickPrompts]="inferenceLlmQuickPrompts"
+  />
+</div>

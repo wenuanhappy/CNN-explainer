@@ -1,0 +1,13 @@
+<app-mode-e-explainer-shell
+  [user]="user"
+  (logoutRequested)="logout()"
+/>
+
+<app-teaching-search-fab />
+
+<app-llm-floating-assistant
+  title="模式 E AI 学习助手"
+  [systemPrompt]="modeELlmSystemPrompt"
+  [contextProvider]="modeELlmContextProvider"
+  [quickPrompts]="modeELlmQuickPrompts"
+/>
