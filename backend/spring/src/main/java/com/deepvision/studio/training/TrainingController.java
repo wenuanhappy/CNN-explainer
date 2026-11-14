@@ -2,7 +2,6 @@ package com.deepvision.studio.training;
 
 import com.deepvision.studio.training.TrainingDtos.CheckpointTestResult;
 import com.deepvision.studio.training.TrainingDtos.CollaborationRoomSummary;
-import com.deepvision.studio.training.TrainingDtos.DatasetErrorResponse;
 import com.deepvision.studio.training.TrainingDtos.DatasetImportResponse;
 import com.deepvision.studio.training.TrainingDtos.InferenceSampleListResponse;
 import com.deepvision.studio.training.TrainingDtos.SingleInferenceRequest;
@@ -13,6 +12,7 @@ import com.deepvision.studio.training.TrainingDtos.TrainingCheckpointSummary;
 import com.deepvision.studio.training.TrainingDtos.TrainingControlResponse;
 import com.deepvision.studio.training.TrainingDtos.TrainingDatasetDetail;
 import com.deepvision.studio.training.TrainingDtos.TrainingDatasetOption;
+import com.deepvision.studio.training.TrainingDtos.TrainingErrorResponse;
 import com.deepvision.studio.training.TrainingDtos.TrainingStartResponse;
 import com.deepvision.studio.training.TrainingDtos.TrainingStatusResponse;
 import com.deepvision.studio.training.TrainingDtos.WeightHistogramResponse;
@@ -241,10 +241,36 @@ public class TrainingController {
     return jobService.save(username(principal), jobId);
   }
 
+  @ExceptionHandler(TrainingApiException.class)
+  ResponseEntity<TrainingErrorResponse> trainingApiError(
+      TrainingApiException ex,
+      jakarta.servlet.http.HttpServletRequest request
+  ) {
+    String requestId = resolveRequestId(request);
+    return ResponseEntity.status(ex.httpStatus())
+        .header("X-Request-Id", requestId)
+        .body(new TrainingErrorResponse(ex.code(), ex.getMessage(), ex.details(), requestId));
+  }
+
   @ExceptionHandler(IllegalArgumentException.class)
-  ResponseEntity<DatasetErrorResponse> trainingBadRequest(IllegalArgumentException ex) {
+  ResponseEntity<TrainingErrorResponse> trainingBadRequest(
+      IllegalArgumentException ex,
+      jakarta.servlet.http.HttpServletRequest request
+  ) {
+    String requestId = resolveRequestId(request);
     return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-        .body(new DatasetErrorResponse("BAD_REQUEST", ex.getMessage()));
+        .header("X-Request-Id", requestId)
+        .body(new TrainingErrorResponse("BAD_REQUEST", ex.getMessage(), java.util.Map.of(), requestId));
+  }
+
+  private String resolveRequestId(jakarta.servlet.http.HttpServletRequest request) {
+    if (request != null) {
+      String header = request.getHeader("X-Request-Id");
+      if (header != null && !header.isBlank()) {
+        return header.trim();
+      }
+    }
+    return java.util.UUID.randomUUID().toString();
   }
 
   private String username(Principal principal) {

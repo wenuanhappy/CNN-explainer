@@ -1,5 +1,6 @@
 package com.deepvision.studio.training;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.Valid;
@@ -8,6 +9,7 @@ import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 
 public final class TrainingDtos {
   private TrainingDtos() {}
@@ -73,6 +75,19 @@ public final class TrainingDtos {
   @Schema(description = "Dataset error response")
   public record DatasetErrorResponse(String error, String message) {}
 
+  @Schema(description = "Unified training error response (provisional, pending Member 2 alignment)")
+  public record TrainingErrorResponse(
+      String code,
+      String message,
+      Map<String, Object> details,
+      String requestId,
+      String error
+  ) {
+    public TrainingErrorResponse(String code, String message, Map<String, Object> details, String requestId) {
+      this(code, message, details == null ? Map.of() : details, requestId, code);
+    }
+  }
+
   @Schema(description = "Train/validation/test split ratios")
   public record SplitRequest(double train, double val, double test) {}
 
@@ -117,6 +132,7 @@ public final class TrainingDtos {
   ) {}
 
   @Schema(description = "Training metric stream message")
+  @JsonIgnoreProperties(ignoreUnknown = true)
   public record TrainingMetricMessage(
       String type,
       String jobId,
@@ -177,6 +193,7 @@ public final class TrainingDtos {
   ) {}
 
   @Schema(description = "Checkpoint test evaluation result")
+  @JsonIgnoreProperties(ignoreUnknown = true)
   public record CheckpointTestResult(
       String type,
       String jobId,
