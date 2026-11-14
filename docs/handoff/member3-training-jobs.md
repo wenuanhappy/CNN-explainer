@@ -5,9 +5,9 @@
 ## 基本信息
 
 - 分支：`feature/member3-training-job-control`（基于 `origin/main` @ `32a7d80`）
-- 最近更新：2026-11-14 15:42 by member3-agent
-- 当前状态：进行中（已完成 T3-01 ~ T3-09 全部功能实现，正在补全端到端 MockMvc + 真实子进程集成测试）
-- PR：未创建
+- 最近更新：2026-11-14 15:50 by member3-agent
+- 当前状态：待评审（P0 任务 T3-01 ~ T3-09 与 AC-03.1 ~ AC-03.5 全部完成并通过 19 项 Java + 7 项 Python 自动化测试）
+- PR：待创建（本机未安装 `gh` CLI，分支推送后可通过下方 `gh pr create` 命令或 GitHub Compare 链接一键提交向 `main` 的 PR）
 - 任务依据：《DeepVision Studio 五人小组任务分工与验收安排》第 6 节（成员3），只做 P0，不做 P1
 
 ## 任务进度
@@ -22,7 +22,7 @@
 | T3-06 | 启动失败、非零退出、停止超时、残留进程、槽位释放 | 完成 | `24d0730` | 覆盖启动异常、非零退出、`jobTimeout`、`stopTimeout`、子进程树清理与全路径槽位回收 |
 | T3-07 | 重启后未知活动任务标记 interrupted | 完成 | `24d0730` | 启动时扫描无受管存活进程的 `queued/running/paused` 任务置为 `interrupted`（不做续训） |
 | T3-08 | 实际设备上报、友好的 OOM 提示、CPU 路径 | 完成 | `83339a2` | worker 上报 `device`（`cuda`/`cpu`）、补全 `paused/running/stopped` 确认、CUDA OOM 退出码 `2` 与友好建议、CPU 训练单测 |
-| T3-09 | 事件 `jobId/sequence/timestamp/schemaVersion`，以及状态和历史查询 | 完成 | 本次提交 | 统一对外事件信封 + `TrainingJobEvent` 有界历史表 + `GET /api/training/{jobId}/events` |
+| T3-09 | 事件 `jobId/sequence/timestamp/schemaVersion`，以及状态和历史查询 | 完成 | `0b311c4` | 统一对外事件信封 + `TrainingJobEvent` 有界历史表 + `GET /api/training/{jobId}/events` |
 
 ## 现状核查（已复核，基于 main @ 32a7d80）
 
@@ -111,22 +111,24 @@
 - `backend/spring/src/main/java/com/deepvision/studio/training/TrainingJobEvent.java`（新增，任务有界事件历史 JPA 实体）
 - `backend/spring/src/main/java/com/deepvision/studio/training/TrainingJobEventRepository.java`（新增，按序号增量查询与窗口裁剪 Repository）
 - `backend/spring/src/test/java/com/deepvision/studio/training/TrainingEventStreamAndHistoryTest.java`（新增，T3-09 事件信封、增量查询、有界裁剪与重启查询单测）
+- `backend/spring/src/test/java/com/deepvision/studio/training/FakeWorkerMain.java`（新增，零外部依赖的真实 OS 子进程测试 worker，实现完整 `request.json`/`control.json`/stdout/`checkpoint.pt` 协议）
+- `backend/spring/src/test/java/com/deepvision/studio/training/TrainingEndToEndIntegrationTest.java`（新增，`@SpringBootTest` + `MockMvc` + 真实 OS 子进程端到端验收测试，覆盖 B 模式「启动 → 暂停占槽 → 排队/429 → 停止晋升 → 完成 → 保存 checkpoint → 事件历史查询」与 `NetworkValidator` 接入契约）
 
 ## 运行与测试方法
 
-- Java：`cd backend/spring; mvn -q test`（当前本地环境中 Maven 安装于会话临时目录，使用 OpenJDK 21 按 Java 17 目标编译运行）
-- Python：`cd backend/python-training; .\.venv\Scripts\python.exe -m pytest tests -q`
+- Java（标准环境）：`cd backend/spring && mvn -q test`（期望输出：退出码 `0`，19 项测试全部通过，0 失败 0 错误）
+- Python：`cd backend/python-training && .\.venv\Scripts\python.exe -m pytest tests -q`（期望输出：`7 passed`）
 - 实际执行结果记录在下方「验收记录」与「会话日志」中。
 
 ## 验收记录
 
 | 验收编号 | 环境与输入 | 操作或命令 | 预期 | 实际 | 证据位置 | 结论 |
 | --- | --- | --- | --- | --- | --- | --- |
-| AC-03.1 | 内存 H2 + `ControllableTrainingProcessLauncher`（并发上限 1、队列上限 0），同一用户携带 `Idempotency-Key: idem-key-001` | `mvn -q test` 执行 `TrainingIdempotencyTest`（8 线程栅栏同时提交 + 顺序重试 + 异构配置冲突校验） | 只有 1 个任务，最多 1 个进程 | 数据库仅创建 1 条 `TrainingJob`，仅启动 1 个进程，所有重试返回相同 `jobId` 且 `idempotentReplay=true`；同键异配置返回 HTTP 409 `IDEMPOTENCY_KEY_CONFLICT` | `TrainingIdempotencyTest.java` | 通过 |
+| AC-03.1 | 内存 H2 + `ControllableTrainingProcessLauncher` 及 `@SpringBootTest` + `MockMvc` 携带 `Idempotency-Key` | `mvn -q test` 执行 `TrainingIdempotencyTest`（8 线程并发栅栏 + 顺序重试 + 异配置冲突）与 `TrainingEndToEndIntegrationTest` | 只有 1 个任务，最多 1 个进程 | 数据库仅创建 1 条 `TrainingJob`，仅启动 1 个进程，所有重试返回相同 `jobId` 且 `idempotentReplay=true`；同键异配置返回 HTTP 409 `IDEMPOTENCY_KEY_CONFLICT` | `TrainingIdempotencyTest.java`, `TrainingEndToEndIntegrationTest.java` | 通过 |
 | AC-03.2 | 测试配置：并发 2、队列 3、单用户上限 10，内存 H2 + `ControllableTrainingProcessLauncher` | `mvn -q test` 执行 `TrainingCapacityAndQueueTest` 6 线程栅栏并发提交 | 最多 2 个执行、3 个排队，其余收到容量错误 | 2 个 `running`（启动 2 个受管进程）、3 个 `queued`、1 个抛出 HTTP 429 `TRAINING_CAPACITY_EXCEEDED`；首个任务完成后队首自动晋升为 `running` | `TrainingCapacityAndQueueTest.java` | 通过 |
-| AC-03.3 | 内存 H2 + `ControllableTrainingProcessLauncher` | `mvn -q test` 执行 `TrainingControlConfirmationTest`（依次测试 pause/resume/stop、已完成任务调用 resume、以及卡死 worker 的 `stopTimeout`） | 经确认后才变更状态；resume 返回 409 | 调用 `pause/resume/stop` 后仅写 `control.json` 并标记 `pendingControl`（主状态不变），worker 输出 `control` 事件后才切换为 `paused/running/stopped`；对 `completed` 任务调用 `resume` 抛出 HTTP 409 `INVALID_STATE_TRANSITION`；超时未确认时强杀并记录 `STOP_TIMEOUT` | `TrainingControlConfirmationTest.java` | 通过 |
-| AC-03.4 | 内存 H2 + `ControllableTrainingProcessLauncher`（双实例共享同一数据库模拟重启） | `mvn -q test` 执行 `TrainingFailureAndRecoveryTest`（外部强杀进程退出码 137；旧实例关闭后启动新实例恢复） | 状态为 failed / interrupted，并有原因 | 强杀 worker 后状态变为 `failed`，记录 `exitCode=137`、`errorCode=WORKER_NON_ZERO_EXIT` 及失败原因；重启后残留 `running/paused/queued` 任务全部变为 `interrupted`（`SERVICE_RESTART_INTERRUPTED`）而已完成任务保持 `completed` | `TrainingFailureAndRecoveryTest.java` | 通过 |
-| AC-03.5 | 内存 H2 + `ControllableTrainingProcessLauncher`（覆盖正常完成、stop、强杀、启动失败、超时） | `mvn -q test` 执行 `TrainingFailureAndRecoveryTest` 与 `TrainingControlConfirmationTest` | 释放槽位，没有遗留的未知受管进程 | 所有终止路径均立即释放 `activeSlotJobIds`、自动晋升队列下一任务，且结束时 `activeSlotCount()==0`、`activeManagedProcessCount()==0` | `TrainingFailureAndRecoveryTest.java`, `TrainingControlConfirmationTest.java` | 通过 |
+| AC-03.3 | 内存 H2 + 模拟/真实 OS 子进程 worker | `mvn -q test` 执行 `TrainingControlConfirmationTest`、`TrainingEndToEndIntegrationTest` 与 `pytest` 控制单测 | 经确认后才变更状态；resume 返回 409 | 调用 `pause/resume/stop` 后仅写 `control.json` 并标记 `pendingControl`（主状态不变），worker 输出 `control` 事件后才切换为 `paused/running/stopped`；对 `completed` 任务调用 `resume` 返回 HTTP 409 `INVALID_STATE_TRANSITION`；超时未确认时强杀并记录 `STOP_TIMEOUT` | `TrainingControlConfirmationTest.java`, `TrainingEndToEndIntegrationTest.java`, `test_training_worker_control.py` | 通过 |
+| AC-03.4 | 内存 H2 + `ControllableTrainingProcessLauncher`（双实例共享同一数据库模拟重启） | `mvn -q test` 执行 `TrainingFailureAndRecoveryTest` 与 `TrainingEventStreamAndHistoryTest` | 状态为 failed / interrupted，并有原因 | 强杀 worker 后状态变为 `failed`，记录 `exitCode=137`、`errorCode=WORKER_NON_ZERO_EXIT` 及失败原因；重启后残留 `running/paused/queued` 任务全部变为 `interrupted`（`SERVICE_RESTART_INTERRUPTED`）并记录带序号恢复事件，已完成任务保持 `completed` | `TrainingFailureAndRecoveryTest.java`, `TrainingEventStreamAndHistoryTest.java` | 通过 |
+| AC-03.5 | 内存 H2 + 模拟与真实 OS 子进程（覆盖正常完成、stop、强杀、启动失败、超时） | `mvn -q test` 执行 `TrainingFailureAndRecoveryTest`、`TrainingControlConfirmationTest` 与 `TrainingEndToEndIntegrationTest` | 释放槽位，没有遗留的未知受管进程 | 所有终止路径均立即释放 `activeSlotJobIds`、自动晋升队列下一任务，且结束时 `activeSlotCount()==0`、`activeManagedProcessCount()==0`；B 模式「启动 → 完成 → 保存 checkpoint」回归通过 | `TrainingFailureAndRecoveryTest.java`, `TrainingEndToEndIntegrationTest.java` | 通过 |
 
 结论只能填：通过 / 失败 / 阻塞 / 未执行。
 
@@ -139,8 +141,14 @@
 
 ## 下一步（按优先级，下一个 agent 从这里开始）
 
-1. 补全端到端真实 OS 子进程与 MockMvc 契约集成测试（含 B 模式正常「启动 → 完成 → 保存 checkpoint」回归校验与 `NetworkValidator` 拦截回归），运行全套 `mvn test` 与 `pytest`。
-2. 推送 `feature/member3-training-job-control` 分支并创建向 `main` 的 PR（或若本机缺少 `gh` CLI，记录状态并给出手动创建 PR 命令）。
+1. 在已安装并登录 `gh` 的环境中执行创建 PR 命令（或直接在浏览器打开 `https://github.com/CiaCrystal/CNN-explainer/compare/main...feature/member3-training-job-control?expand=1` 提交 PR）：
+   ```powershell
+   gh pr create --base main --head feature/member3-training-job-control --title "feat(training): implement P0 training job lifecycle, resource limits, and recovery (T3-01..T3-09)"
+   ```
+2. 代码评审与联调对齐：
+   - 与成员2对齐 `TrainingErrorResponse`（`code/message/details/requestId`）全局收敛及 `NetworkValidator` Bean 接入；
+   - 与成员4对齐 `queued / failed / interrupted` 状态、`pendingControl` 过渡指示、`Idempotency-Key` 请求头与 `/events?afterSequence=N` 增量拉取；
+   - 与成员5对齐 `backend/spring/pom.xml` 测试依赖与 CI 流水线执行 `mvn -q test` + `pytest`。
 
 ## 会话日志
 
@@ -149,7 +157,8 @@
 - 2026-11-14 14:55（member3-agent）：完成 T3-02（`TrainingJobStatus`、`TrainingControlAction`、`TrainingJobStateMachine` 集中转换表与暂停占槽策略、统一错误契约 `TrainingErrorResponse`、`NetworkValidator` 扩展接口及单测，提交 `4249500`）。
 - 2026-11-14 15:08（member3-agent）：完成 T3-03（`TrainingProperties`、`TrainingProcessLauncher`、并发槽位与有界队列调度、`TrainingCapacityAndQueueTest` 验收 AC-03.2，`mvn test` 与 `pytest` 均通过，提交 `4760840`）。
 - 2026-11-14 15:11（member3-agent）：完成 T3-04（`Idempotency-Key` 幂等启动、配置摘要冲突 409 拦截与 `TrainingIdempotencyTest` 验收 AC-03.1，`mvn test` 与 `pytest` 均通过，提交 `082b725`）。
-- 2026-11-14 15:15（member3-agent）：完成 T3-05（控制请求受理与 worker 执行确认分离、`stopTimeout` 强杀兜底、终态 `resume` 409 校验与 `TrainingControlConfirmationTest` 验收 AC-03.3，`mvn test` 与 `pytest` 均通过，提交 `082b725` -> `0a4d9bf`）。
+- 2026-11-14 15:15（member3-agent）：完成 T3-05（控制请求受理与 worker 执行确认分离、`stopTimeout` 强杀兜底、终态 `resume` 409 校验与 `TrainingControlConfirmationTest` 验收 AC-03.3，`mvn test` 与 `pytest` 均通过，提交 `0a4d9bf`）。
 - 2026-11-14 15:19（member3-agent）：完成 T3-06 & T3-07（全路径异常清理、槽位回收、重启恢复 `interrupted` 与 `TrainingFailureAndRecoveryTest` 验收 AC-03.4/AC-03.5，`mvn test` 与 `pytest` 均通过，提交 `24d0730`）。
 - 2026-11-14 15:26（member3-agent）：完成 T3-08（`training_worker.py` 设备上报、控制确认事件、CUDA OOM 友好提示与退出码，消除 Java stdout 与 `waitFor` 尾行竞态，`mvn test` 15 项与 `pytest` 7 项全部通过，提交 `83339a2`）。
-- 2026-11-14 15:42（member3-agent）：完成 T3-09（对外事件统一补齐 `jobId/sequence/timestamp/schemaVersion`、`TrainingJobEvent` 有界历史持久化、`GET /api/training/{jobId}/events` 增量查询与 `TrainingEventStreamAndHistoryTest`，`mvn test` 17 项与 `pytest` 7 项全部通过）。
+- 2026-11-14 15:42（member3-agent）：完成 T3-09（对外事件统一补齐 `jobId/sequence/timestamp/schemaVersion`、`TrainingJobEvent` 有界历史持久化、`GET /api/training/{jobId}/events` 增量查询与 `TrainingEventStreamAndHistoryTest`，`mvn test` 17 项与 `pytest` 7 项全部通过，提交 `0b311c4`）。
+- 2026-11-14 15:50（member3-agent）：新增真实 OS 子进程 `FakeWorkerMain` 与 `TrainingEndToEndIntegrationTest`（`@SpringBootTest` + `MockMvc` 覆盖 B 模式完整训练保存闭环、HTTP 409/429/422 错误契约、`NetworkValidator` 钩子与进程回收），全套 19 项 Java 测试与 7 项 Python pytest 测试全部通过；执行分支推送并因本机无 `gh` CLI 停在手动提交 PR 步骤。
