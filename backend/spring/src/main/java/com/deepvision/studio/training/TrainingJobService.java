@@ -69,6 +69,8 @@ import org.springframework.web.socket.WebSocketSession;
 @Service
 public class TrainingJobService {
   public static final String EVENT_SCHEMA_VERSION = "1.0";
+  static final int EVENT_PRUNE_BATCH_SIZE = 16;
+  static final int ENTITY_FLUSH_EVENT_INTERVAL = 16;
   private static final DateTimeFormatter JOB_ID_TIME = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
   private static final int MAX_CHECKPOINT_METRIC_HISTORY = 2000;
 
@@ -220,7 +222,7 @@ public class TrainingJobService {
 
     ScheduledLaunch scheduledLaunch = null;
     Integer queuePosition = null;
-    String queuedEventJson = null;
+    PendingEventWrite pendingQueuedEvent = null;
     String initialStatus;
     String jobId;
 
@@ -325,12 +327,12 @@ public class TrainingJobService {
         queuedEvent.put("status", TrainingJobStatus.QUEUED.wireValue());
         queuedEvent.put("queuePosition", queuePosition);
         queuedEvent.put("message", "Training job queued.");
-        queuedEventJson = recordRuntimeEventLocked(runtime, queuedEvent, now);
+        pendingQueuedEvent = prepareRuntimeEventLocked(runtime, queuedEvent, now, true);
       }
     }
 
-    if (queuedEventJson != null) {
-      broadcastRaw(jobId, queuedEventJson);
+    if (pendingQueuedEvent != null) {
+      persistAndBroadcastEvent(pendingQueuedEvent);
     }
 
     if (scheduledLaunch != null) {
@@ -419,14 +421,35 @@ public class TrainingJobService {
       long afterSequence,
       int limit
   ) {
-    int effectiveLimit = Math.min(limit, properties.getMaxHistoryEvents());
+    int maxHistory = properties.getMaxHistoryEvents();
+    int effectiveLimit = Math.min(limit, maxHistory);
+    if (runtime != null) {
+      runtime.awaitPendingEventWrites();
+    }
+    String jobId;
+    String currentStatus;
+    long lastSequence;
     synchronized (schedulerLock) {
-      String jobId = entity.getJobId();
-      String currentStatus = entity.getStatus();
-      long lastSequence = entity.getLastSequence();
+      if (runtime != null && runtime.isEntityDirtyLocked()) {
+        jobRepository.saveAndFlush(entity);
+        runtime.clearEntityDirtyLocked();
+      }
+      jobId = entity.getJobId();
+      currentStatus = entity.getStatus();
+      lastSequence = entity.getLastSequence();
+    }
+    Object queryLock = runtime != null ? runtime.persistenceLock() : new Object();
+    synchronized (queryLock) {
       Long earliestAvailable;
       List<JsonNode> payloads;
       if (eventRepository != null) {
+        long targetPruneFloor = lastSequence - maxHistory;
+        if (targetPruneFloor > 0L && (runtime == null || targetPruneFloor > runtime.lastPrunedUpToSequence())) {
+          eventRepository.deleteByJobIdAndSequenceLessThanEqual(jobId, targetPruneFloor);
+          if (runtime != null) {
+            runtime.setLastPrunedUpToSequence(targetPruneFloor);
+          }
+        }
         earliestAvailable = eventRepository.findFirstByJobIdOrderBySequenceAsc(jobId)
             .map(TrainingJobEvent::getSequence)
             .orElse(null);
@@ -569,7 +592,7 @@ public class TrainingJobService {
 
   private TrainingControlResponse stop(ManagedJobRuntime runtime) {
     String statusSnapshot;
-    String stoppedQueuedJson = null;
+    PendingEventWrite pendingStoppedQueued = null;
     synchronized (schedulerLock) {
       TrainingJobStateMachine.validateControlRequest(
           runtime.jobId(), runtime.statusEnum(), runtime.pendingControlEnum(), TrainingControlAction.STOP
@@ -581,7 +604,7 @@ public class TrainingJobService {
         stoppedEvent.put("type", "control");
         stoppedEvent.put("status", TrainingJobStatus.STOPPED.wireValue());
         stoppedEvent.put("message", "Queued training job stopped.");
-        stoppedQueuedJson = recordRuntimeEventLocked(runtime, stoppedEvent, Instant.now());
+        pendingStoppedQueued = prepareRuntimeEventLocked(runtime, stoppedEvent, Instant.now(), true);
         statusSnapshot = runtime.status();
       } else {
         if (runtime.pendingControlEnum() != TrainingControlAction.STOP) {
@@ -589,13 +612,14 @@ public class TrainingJobService {
           runtime.entity().setPendingControl(TrainingControlAction.STOP.wireValue());
           runtime.entity().setUpdatedAt(Instant.now());
           jobRepository.saveAndFlush(runtime.entity());
+          runtime.clearEntityDirtyLocked();
           scheduleStopTimeoutLocked(runtime, runtime.currentRunGenerationLocked());
         }
         statusSnapshot = runtime.status();
       }
     }
-    if (stoppedQueuedJson != null) {
-      broadcastRaw(runtime.jobId(), stoppedQueuedJson);
+    if (pendingStoppedQueued != null) {
+      persistAndBroadcastEvent(pendingStoppedQueued);
       return new TrainingControlResponse(runtime.jobId(), statusSnapshot, "Queued training job stopped.", null, true);
     }
     return new TrainingControlResponse(
@@ -807,7 +831,13 @@ public class TrainingJobService {
   void shutdown() {
     shuttingDown = true;
     synchronized (schedulerLock) {
-      runtimes.values().forEach(ManagedJobRuntime::invalidateRunGenerationAndDestroyProcessLocked);
+      for (ManagedJobRuntime runtime : runtimes.values()) {
+        runtime.invalidateRunGenerationAndDestroyProcessLocked();
+        if (runtime.isEntityDirtyLocked()) {
+          jobRepository.saveAndFlush(runtime.entity());
+          runtime.clearEntityDirtyLocked();
+        }
+      }
     }
     timerExecutor.shutdownNow();
     workerIoExecutor.shutdownNow();
@@ -1025,15 +1055,15 @@ public class TrainingJobService {
     if ("metric".equals(type)) {
       try {
         TrainingMetricMessage metric = objectMapper.treeToValue(eventNode, TrainingMetricMessage.class);
-        String rawJson;
+        PendingEventWrite pending;
         synchronized (schedulerLock) {
           if (!runtime.isActiveRunGeneration(runGeneration)) {
             return;
           }
           runtime.updateMetrics(metric);
-          rawJson = recordRuntimeEventLocked(runtime, eventNode, Instant.now());
+          pending = prepareRuntimeEventLocked(runtime, eventNode, Instant.now(), false);
         }
-        broadcastRaw(runtime.jobId(), rawJson);
+        persistAndBroadcastEvent(pending);
       } catch (JsonProcessingException ignored) {
         // Ignore malformed metric rows from the worker.
       }
@@ -1055,9 +1085,9 @@ public class TrainingJobService {
           // Keep streaming the test result even if persistence fails.
         }
       }
-      appendAndBroadcastWorkerEvent(runtime, runGeneration, eventNode);
+      appendAndBroadcastWorkerEvent(runtime, runGeneration, eventNode, true);
     } else if ("backprop".equals(type)) {
-      appendAndBroadcastWorkerEvent(runtime, runGeneration, eventNode);
+      appendAndBroadcastWorkerEvent(runtime, runGeneration, eventNode, false);
     } else if ("error".equals(type)) {
       String errorCode = eventNode.path("errorCode").asText("WORKER_RUNTIME_ERROR");
       String message = eventNode.path("message").asText("Python training worker failed.");
@@ -1067,7 +1097,7 @@ public class TrainingJobService {
         }
         runtime.recordWorkerError(errorCode, message);
       }
-      appendAndBroadcastWorkerEvent(runtime, runGeneration, eventNode);
+      appendAndBroadcastWorkerEvent(runtime, runGeneration, eventNode, true);
     }
   }
 
@@ -1078,7 +1108,7 @@ public class TrainingJobService {
       ObjectNode eventNode
   ) {
     List<ScheduledLaunch> promoted = new ArrayList<>();
-    String rawJson;
+    PendingEventWrite pending;
     synchronized (schedulerLock) {
       if (!runtime.isActiveRunGeneration(runGeneration)) {
         return;
@@ -1130,9 +1160,9 @@ public class TrainingJobService {
           }
         }
       }
-      rawJson = recordRuntimeEventLocked(runtime, eventNode, Instant.now());
+      pending = prepareRuntimeEventLocked(runtime, eventNode, Instant.now(), true);
     }
-    broadcastRaw(runtime.jobId(), rawJson);
+    persistAndBroadcastEvent(pending);
     launchPromotedRuntimes(promoted);
   }
 
@@ -1194,6 +1224,7 @@ public class TrainingJobService {
             runtime.entity().setExitCode(exitCode);
             runtime.entity().setUpdatedAt(Instant.now());
             jobRepository.saveAndFlush(runtime.entity());
+            runtime.clearEntityDirtyLocked();
           }
           if (activeSlotJobIds.contains(runtime.jobId())) {
             releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
@@ -1275,6 +1306,7 @@ public class TrainingJobService {
       runtime.cancelTimers();
     }
     jobRepository.saveAndFlush(entity);
+    runtime.clearEntityDirtyLocked();
   }
 
   private void releaseSlotAndCollectNextLocked(String finishedJobId, List<ScheduledLaunch> promotedOut) {
@@ -1294,6 +1326,7 @@ public class TrainingJobService {
       candidate.entity().setStartedAt(now);
       candidate.entity().setUpdatedAt(now);
       jobRepository.saveAndFlush(candidate.entity());
+      candidate.clearEntityDirtyLocked();
       activeSlotJobIds.add(nextJobId);
       promotedOut.add(new ScheduledLaunch(candidate, candidate.allocateRunGenerationLocked()));
     }
@@ -1321,40 +1354,97 @@ public class TrainingJobService {
     appendAndBroadcastEvent(runtime, node);
   }
 
-  private void appendAndBroadcastWorkerEvent(ManagedJobRuntime runtime, long runGeneration, ObjectNode eventNode) {
-    String rawJson;
+  private void appendAndBroadcastWorkerEvent(
+      ManagedJobRuntime runtime,
+      long runGeneration,
+      ObjectNode eventNode,
+      boolean flushJobEntityNow
+  ) {
+    PendingEventWrite pending;
     synchronized (schedulerLock) {
       if (!runtime.isActiveRunGeneration(runGeneration)) {
         return;
       }
-      rawJson = recordRuntimeEventLocked(runtime, eventNode, Instant.now());
+      pending = prepareRuntimeEventLocked(runtime, eventNode, Instant.now(), flushJobEntityNow);
     }
-    broadcastRaw(runtime.jobId(), rawJson);
+    persistAndBroadcastEvent(pending);
   }
 
   private void appendAndBroadcastEvent(ManagedJobRuntime runtime, ObjectNode eventNode) {
-    String rawJson;
+    PendingEventWrite pending;
     synchronized (schedulerLock) {
-      rawJson = recordRuntimeEventLocked(runtime, eventNode, Instant.now());
+      pending = prepareRuntimeEventLocked(runtime, eventNode, Instant.now(), true);
     }
-    broadcastRaw(runtime.jobId(), rawJson);
+    persistAndBroadcastEvent(pending);
   }
 
-  private String recordRuntimeEventLocked(ManagedJobRuntime runtime, ObjectNode eventNode, Instant now) {
-    SequencedEventRecord record = persistSequencedEventLocked(runtime.entity(), eventNode, now);
-    runtime.addSequencedEvent(record);
-    return record.rawJson();
+  private PendingEventWrite prepareRuntimeEventLocked(
+      ManagedJobRuntime runtime,
+      ObjectNode eventNode,
+      Instant now,
+      boolean flushJobEntityNow
+  ) {
+    TrainingJob entity = runtime.entity();
+    long nextSeq = entity.getLastSequence() + 1L;
+    entity.setLastSequence(nextSeq);
+    entity.setUpdatedAt(now);
+    boolean periodicFlush = runtime.markEntityDirtyAndShouldFlushLocked(ENTITY_FLUSH_EVENT_INTERVAL);
+    if (flushJobEntityNow || periodicFlush || runtime.statusEnum().isTerminal()) {
+      jobRepository.saveAndFlush(entity);
+      runtime.clearEntityDirtyLocked();
+    }
+
+    String jobId = entity.getJobId();
+    String eventType = eventNode.path("type").asText("unknown");
+    eventNode.put("jobId", jobId);
+    eventNode.put("sequence", nextSeq);
+    eventNode.put("timestamp", now.toString());
+    eventNode.put("schemaVersion", EVENT_SCHEMA_VERSION);
+
+    ObjectNode snapshot = eventNode.deepCopy();
+    String rawJson = snapshot.toString();
+    runtime.addSequencedEvent(new SequencedEventRecord(nextSeq, snapshot, rawJson));
+
+    if (eventRepository != null) {
+      TrainingJobEvent eventRow = new TrainingJobEvent(
+          jobId,
+          nextSeq,
+          eventType,
+          EVENT_SCHEMA_VERSION,
+          now,
+          rawJson
+      );
+      runtime.incrementPendingEventWrites();
+      return new PendingEventWrite(runtime, eventRow, rawJson, runtime.statusEnum().isTerminal());
+    }
+    return new PendingEventWrite(runtime, null, rawJson, false);
+  }
+
+  private void persistAndBroadcastEvent(PendingEventWrite pending) {
+    if (pending.eventRow() != null && eventRepository != null) {
+      ManagedJobRuntime runtime = pending.runtime();
+      synchronized (runtime.persistenceLock()) {
+        try {
+          eventRepository.save(pending.eventRow());
+          int maxHistory = properties.getMaxHistoryEvents();
+          long seq = pending.eventRow().getSequence();
+          long targetPruneFloor = seq - maxHistory;
+          if (targetPruneFloor > runtime.lastPrunedUpToSequence()) {
+            long unprunedOverflow = targetPruneFloor - runtime.lastPrunedUpToSequence();
+            if (pending.terminalEvent() || unprunedOverflow >= EVENT_PRUNE_BATCH_SIZE) {
+              eventRepository.deleteByJobIdAndSequenceLessThanEqual(runtime.jobId(), targetPruneFloor);
+              runtime.setLastPrunedUpToSequence(targetPruneFloor);
+            }
+          }
+        } finally {
+          runtime.decrementPendingEventWritesInPersistenceLock();
+        }
+      }
+    }
+    broadcastRaw(pending.runtime().jobId(), pending.rawJson());
   }
 
   private String recordEntityEventLocked(TrainingJob entity, ObjectNode eventNode, Instant now) {
-    return persistSequencedEventLocked(entity, eventNode, now).rawJson();
-  }
-
-  private SequencedEventRecord persistSequencedEventLocked(
-      TrainingJob entity,
-      ObjectNode eventNode,
-      Instant now
-  ) {
     long nextSeq = entity.getLastSequence() + 1L;
     entity.setLastSequence(nextSeq);
     entity.setUpdatedAt(now);
@@ -1383,7 +1473,7 @@ public class TrainingJobService {
         eventRepository.deleteByJobIdAndSequenceLessThanEqual(jobId, nextSeq - maxHistory);
       }
     }
-    return new SequencedEventRecord(nextSeq, snapshot, rawJson);
+    return rawJson;
   }
 
   private void broadcastRaw(String jobId, String payload) {
@@ -1916,6 +2006,13 @@ public class TrainingJobService {
 
   private record ScheduledLaunch(ManagedJobRuntime runtime, long runGeneration) {}
 
+  private record PendingEventWrite(
+      ManagedJobRuntime runtime,
+      TrainingJobEvent eventRow,
+      String rawJson,
+      boolean terminalEvent
+  ) {}
+
   private final class ManagedJobRuntime {
     private final TrainingJob entity;
     private final StartTrainingRequest request;
@@ -1923,6 +2020,10 @@ public class TrainingJobService {
     private final Path requestFile;
     private final Path controlFile;
     private final Path checkpointFile;
+    private final Object persistenceLock = new Object();
+    private int pendingEventWrites = 0;
+    private long lastPrunedUpToSequence = 0L;
+    private int dirtyEntityEvents = 0;
     private volatile long runGeneration = 0L;
     private volatile TrainingMetricMessage latestMetric;
     private volatile JsonNode testResult;
@@ -1991,6 +2092,7 @@ public class TrainingJobService {
           entity.setDevice(device);
           entity.setUpdatedAt(Instant.now());
           jobRepository.saveAndFlush(entity);
+          clearEntityDirtyLocked();
         }
       }
     }
@@ -2177,5 +2279,42 @@ public class TrainingJobService {
     }
     private String lastWorkerErrorCode() { return lastWorkerErrorCode; }
     private String lastWorkerErrorMessage() { return lastWorkerErrorMessage; }
+    private Object persistenceLock() { return persistenceLock; }
+    private long lastPrunedUpToSequence() { return lastPrunedUpToSequence; }
+    private void setLastPrunedUpToSequence(long seq) { this.lastPrunedUpToSequence = seq; }
+    private boolean markEntityDirtyAndShouldFlushLocked(int interval) {
+      dirtyEntityEvents += 1;
+      return dirtyEntityEvents >= interval;
+    }
+    private boolean isEntityDirtyLocked() { return dirtyEntityEvents > 0; }
+    private void clearEntityDirtyLocked() { dirtyEntityEvents = 0; }
+    private void incrementPendingEventWrites() {
+      synchronized (persistenceLock) {
+        pendingEventWrites += 1;
+      }
+    }
+    private void decrementPendingEventWritesInPersistenceLock() {
+      pendingEventWrites = Math.max(0, pendingEventWrites - 1);
+      if (pendingEventWrites == 0) {
+        persistenceLock.notifyAll();
+      }
+    }
+    private void awaitPendingEventWrites() {
+      synchronized (persistenceLock) {
+        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (pendingEventWrites > 0) {
+          long remainingMillis = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
+          if (remainingMillis <= 0L) {
+            break;
+          }
+          try {
+            persistenceLock.wait(remainingMillis);
+          } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            break;
+          }
+        }
+      }
+    }
   }
 }

@@ -32,8 +32,8 @@
 | B2 | `launchWorkerForSlotOwner()` 捕获 `RuntimeException` 释放槽位并晋升队列 | 完成 | `2c04439` | 捕获 `IOException \| RuntimeException`，统一转 `failed`（`WORKER_START_FAILED`）、发出合成 `error` 事件、释放槽位并自动晋升排队任务 |
 | B3 | 交接文档与 PR 描述补充成员4前端适配清单（合并前置条件） | 未开始 | | |
 | S1 | 接入 `release-slot-on-pause` 配置（暂停释放槽位、恢复重申槽位/排队） | 完成 | `32254a7` | 接入 `TrainingJobStateMachine.occupiesExecutionSlot`：`true` 时确认暂停后释放槽位并晋升排队任务，`resume` 时重申槽位（无空闲槽位返 429 `TRAINING_CAPACITY_EXCEEDED` / `resume_slot_unavailable`） |
-| S2 | `jobTimeout` 仅累计实际运行时间（暂停停止计时、恢复续计） | 完成 | 本次提交 | 基于单调时钟 `System.nanoTime()` 记录 `remainingJobTimeoutNanos`，`paused` 确认时扣减已运行耗时并取消定时器，`running` 恢复确认后按剩余额度重新计时 |
-| S3 | 事件持久化减少锁内 DB 写入与按间隔批量裁剪历史事件 | 未开始 | | |
+| S2 | `jobTimeout` 仅累计实际运行时间（暂停停止计时、恢复续计） | 完成 | `a396323` | 基于单调时钟 `System.nanoTime()` 记录 `remainingJobTimeoutNanos`，`paused` 确认时扣减已运行耗时并取消定时器，`running` 恢复确认后按剩余额度重新计时 |
+| S3 | 事件持久化减少锁内 DB 写入与按间隔批量裁剪历史事件 | 完成 | 本次提交 | 在 `schedulerLock` 内仅分配单调 `sequence` 与更新内存环形缓冲，`TrainingJobEvent` 插入与批量裁剪移至单任务 `persistenceLock` 锁外执行；流式事件每 16 条才 flush 一次 `TrainingJob`，历史表按溢出阈值 16 条（及终态/按需读取时）批量裁剪 |
 | S4 | 恢复 `TrainingJobService.java` 与 `application.yml` 的 `i/crlf` 换行符 | 完成 | `b4b8790` | 消除约 1490 行纯换行符虚增 diff |
 | 次要项 | 启动恢复单次执行、真实 `exitCode` 回写、终态内存清理、幂等前置校验、Python 路径冲突提示 | 未开始 | | |
 
@@ -70,6 +70,7 @@
 9. **2026-11-14（S2 `jobTimeout` 累计运行时间语义与 30m CPU 默认值评估）**：
    - **超时语义**：`deepvision.training.job-timeout`（`DEEPVISION_TRAINING_JOB_TIMEOUT`）改为**仅累计任务处于 `running` 状态的活跃运行时间**，不计入 `queued` 排队时间与 `paused` 暂停时间。worker 确认 `paused` 时使用 `System.nanoTime()` 扣减本段已运行时间并取消超时定时器；确认恢复 `running` 后按剩余预算重新挂载定时器。
    - **30m 默认值对 CPU 训练的合理性评估**：本项目面向 CNN 教学可视化，内置数据集（`points-2d`、表格 CSV、MNIST 子集约 1k～2k 张 `28x28`、CIFAR-10 子集约 2k～5k 张 `32x32`）及受上传大小上限约束的自定义数据集在主流 4～8 核教学笔记本纯 CPU 环境下，常规 2～3 层卷积 / 20～50 epoch 训练耗时约 5 秒～4 分钟，较深 6 层自定义网络 100 epoch 约 8～15 分钟。在排除课堂演示暂停观察时间后，`30m` 活跃运行上限既为纯 CPU 正常训练留出 2～6 倍安全余量，又能及时回收死循环或卡死进程；超大自定义数据集可通过 `DEEPVISION_TRAINING_JOB_TIMEOUT` 覆盖（如 `60m`）。
+10. **2026-11-14（S3 事件锁外持久化、低频实体 flush 与批量历史裁剪）**：将事件处理拆分为两阶段——在全局 `schedulerLock` 内仅原子递增 `TrainingJob.lastSequence`、追加内存环形缓冲，且高频流式事件（`metric`/`backprop`）每累计 `ENTITY_FLUSH_EVENT_INTERVAL = 16` 条才执行一次 `jobRepository.saveAndFlush`（控制/错误/`test_result`/终态事件仍立即 flush）；而 `eventRepository.save` 与历史窗口裁剪全部移出 `schedulerLock`，在单任务 `runtime.persistenceLock` 下执行，并仅当未裁剪溢出达到 `EVENT_PRUNE_BATCH_SIZE = 16` 或进入终态时批量执行 `deleteByJobIdAndSequenceLessThanEqual`。调用 `GET /api/training/{jobId}/events` 时通过 `awaitPendingEventWrites()` 等待在途落盘并按需裁剪精确窗口，既保证 `sequence` 严格单调与读写一致性，又将流式事件在全局锁内的 DB 写入从每条 3 次降至平均 1/16 次。
 
 ## 接口与协议变更（给成员2/4/5）
 
@@ -194,4 +195,5 @@
 - 2026-11-14 16:33（member3-followup-agent）：完成 B1（引入 `runGeneration` 进程代数消除旧进程回调竞态，`reset()` 采用方案A仅允许终态任务创建新 `jobId` 并保护原 `checkpoint.pt`，新增 `TrainingResetAndGenerationTest` 3 项回归测试），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（22 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过），提交 `1307287`。
 - 2026-11-14 16:35（member3-followup-agent）：完成 B2（`launchWorkerForSlotOwner()` 捕获 `IOException | RuntimeException`，确保任意启动异常均标记 `failed`/`WORKER_START_FAILED`、发出合成 `error` 事件、释放槽位并晋升下一排队任务，在 `TrainingFailureAndRecoveryTest` 新增回归测试），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（23 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过），提交 `2c04439`。
 - 2026-11-14 16:38（member3-followup-agent）：完成 S1（接入 `deepvision.training.release-slot-on-pause`，支持暂停确认释放槽位晋升排队任务、恢复时重申槽位及无槽位 429 错误，在 `TrainingControlConfirmationTest` 补充单测），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（24 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过），提交 `32254a7`。
-- 2026-11-14 16:40（member3-followup-agent）：完成 S2（将 `jobTimeout` 改为基于单调时钟仅累计 `running` 活跃耗时、`paused` 停止计时并在文档中评估 30m CPU 默认值合理性，在 `TrainingFailureAndRecoveryTest` 补充暂停跨超时单测），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（25 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过）。
+- 2026-11-14 16:40（member3-followup-agent）：完成 S2（将 `jobTimeout` 改为基于单调时钟仅累计 `running` 活跃耗时、`paused` 停止计时并在文档中评估 30m CPU 默认值合理性，在 `TrainingFailureAndRecoveryTest` 补充暂停跨超时单测），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（25 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过），提交 `a396323`。
+- 2026-11-14 16:50（member3-followup-agent）：完成 S3（将 `TrainingJobEvent` 写入与裁剪移出全局 `schedulerLock`、流式事件每 16 条批量 flush `TrainingJob`、历史事件按阈值 16 批量裁剪并在读取/终态兜底对齐窗口，在 `TrainingEventStreamAndHistoryTest` 补充批量裁剪单测），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（26 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过）。

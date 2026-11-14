@@ -263,6 +263,82 @@ class TrainingEventStreamAndHistoryTest {
     assertThat(recoveryEvent.get("errorCode").asText()).isEqualTo("SERVICE_RESTART_INTERRUPTED");
   }
 
+  @Test
+  void prunesEventHistoryInBatchesDuringStreamingWhileKeepingExactWindowOnRead() throws Exception {
+    TrainingProperties props = new TrainingProperties();
+    props.setJobsRoot(tempDir.resolve("jobs-batch-prune").toString());
+    props.setMaxConcurrentJobs(1);
+    props.setMaxQueueSize(2);
+    props.setMaxActiveJobsPerUser(4);
+    props.setMaxHistoryEvents(10);
+
+    ControllableTrainingProcessLauncher launcher = new ControllableTrainingProcessLauncher();
+    TrainingJobService service = registerService(new TrainingJobService(
+        TrainingTestFixtures.mockDatasetService(),
+        userRepository,
+        checkpointRepository,
+        jobRepository,
+        eventRepository,
+        (req, ds) -> {},
+        launcher,
+        props,
+        MAPPER,
+        tempDir.resolve("datasets").toString()
+    ));
+
+    TrainingStartResponse started = service.start(TrainingTestFixtures.sampleStartRequest(16, 30), "alice");
+    FakeWorkerProcess worker = launcher.awaitProcess(started.jobId(), Duration.ofSeconds(2));
+
+    // Emit 1 control + 14 metric events = 15 events; overflow is 5 (< EVENT_PRUNE_BATCH_SIZE=16) so DB has not pruned yet
+    worker.emitControl("running", "Started.");
+    for (int step = 1; step <= 14; step++) {
+      worker.emitJson(sampleMetricPayload(started.jobId(), step, step, 1.0 / step, 0.50));
+    }
+
+    TrainingTestFixtures.awaitUntil(
+        Duration.ofSeconds(2),
+        () -> eventRepository.count() == 15L,
+        "Expected 15 persisted events without per-event pruning"
+    );
+    assertThat(eventRepository.count()).isEqualTo(15L);
+
+    // Emit 12 more metric events (sequences 16..27); sequence 26 crosses overflow=16 and triggers batch prune to 10 rows,
+    // then sequence 27 appends 1 row -> 11 rows stored in H2
+    for (int step = 15; step <= 26; step++) {
+      worker.emitJson(sampleMetricPayload(started.jobId(), step, step, 1.0 / step, 0.70));
+    }
+
+    TrainingTestFixtures.awaitUntil(
+        Duration.ofSeconds(2),
+        () -> service.status("alice", started.jobId()).lastSequence() == 27L && eventRepository.count() == 11L,
+        "Expected batch prune to trim stored history once overflow reached batch threshold"
+    );
+    assertThat(eventRepository.count()).isEqualTo(11L);
+
+    // Reading events flushes dirty entity and trims exact maxHistoryEvents=10 window (sequences 18..27)
+    TrainingEventsResponse window = service.events("alice", started.jobId(), 0L, 100);
+    assertThat(window.lastSequence()).isEqualTo(27L);
+    assertThat(window.earliestAvailableSequence()).isEqualTo(18L);
+    assertThat(window.truncated()).isTrue();
+    assertThat(window.events()).hasSize(10);
+    assertThat(window.events().get(0).get("sequence").asLong()).isEqualTo(18L);
+    assertThat(window.events().get(9).get("sequence").asLong()).isEqualTo(27L);
+    assertThat(jobRepository.findById(started.jobId()).orElseThrow().getLastSequence()).isEqualTo(27L);
+
+    // Completing the job emits sequence 28 and prunes immediately on terminal event
+    worker.completeCleanly();
+    TrainingTestFixtures.awaitUntil(
+        Duration.ofSeconds(2),
+        () -> "completed".equals(service.status("alice", started.jobId()).status())
+            && eventRepository.count() == 10L,
+        "Expected terminal event to flush final sequence and prune to exact retention cap"
+    );
+    assertThat(jobRepository.findById(started.jobId()).orElseThrow().getLastSequence()).isEqualTo(28L);
+    TrainingEventsResponse finalWindow = service.events("alice", started.jobId(), 0L, 100);
+    assertThat(finalWindow.events()).extracting(e -> e.get("sequence").asLong())
+        .containsExactly(19L, 20L, 21L, 22L, 23L, 24L, 25L, 26L, 27L, 28L);
+  }
+
   private TrainingJobService registerService(TrainingJobService service) {
     servicesToClose.add(service);
     return service;
