@@ -38,6 +38,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -142,10 +143,17 @@ public class TrainingController {
 
   @PostMapping("/start")
   @Operation(summary = "Start a training job")
-  @ApiResponse(responseCode = "200", description = "Training job started")
+  @ApiResponse(responseCode = "200", description = "Training job started or replayed via Idempotency-Key")
   @ApiResponse(responseCode = "400", description = "Training configuration is invalid")
-  public TrainingStartResponse start(Principal principal, @Valid @RequestBody StartTrainingRequest request) {
-    return jobService.start(request, principal == null ? null : principal.getName());
+  @ApiResponse(responseCode = "409", description = "Idempotency-Key reused with different configuration")
+  @ApiResponse(responseCode = "429", description = "Training capacity or queue limit exceeded")
+  public TrainingStartResponse start(
+      Principal principal,
+      @Parameter(description = "Optional client idempotency key for safe retries")
+      @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
+      @Valid @RequestBody StartTrainingRequest request
+  ) {
+    return jobService.start(request, principal == null ? null : principal.getName(), idempotencyKey);
   }
 
   @GetMapping("/checkpoints")

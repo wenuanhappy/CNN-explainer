@@ -5,8 +5,8 @@
 ## 基本信息
 
 - 分支：`feature/member3-training-job-control`（基于 `origin/main` @ `32a7d80`）
-- 最近更新：2026-11-14 15:08 by member3-agent
-- 当前状态：进行中（已完成 T3-01 ~ T3-03，正在推进 T3-04 ~ T3-09）
+- 最近更新：2026-11-14 15:11 by member3-agent
+- 当前状态：进行中（已完成 T3-01 ~ T3-04，正在推进 T3-05 ~ T3-09）
 - PR：未创建
 - 任务依据：《DeepVision Studio 五人小组任务分工与验收安排》第 6 节（成员3），只做 P0，不做 P1
 
@@ -16,8 +16,8 @@
 | --- | --- | --- | --- | --- |
 | T3-01 | 持久化任务（实体 + Repository） | 完成 | `3e154ba` | `TrainingJob` + `TrainingJobRepository` + `application-test.yml` |
 | T3-02 | 状态机与转换规则、暂停资源策略 | 完成 | `4249500` | 集中转换表 `TrainingJobStateMachine` + `pendingControl` + 409 错误契约 + `NetworkValidator` 预留 |
-| T3-03 | 并发 / 用户活动数 / 队列长度 / 超时配置 | 完成 | 本次提交 | `TrainingProperties` + `TrainingProcessLauncher` + 并发槽位与有界 FIFO 队列，本地默认并发 1 |
-| T3-04 | 幂等启动 | 未开始 | | 拟使用请求头 `Idempotency-Key` |
+| T3-03 | 并发 / 用户活动数 / 队列长度 / 超时配置 | 完成 | `4760840` | `TrainingProperties` + `TrainingProcessLauncher` + 并发槽位与有界 FIFO 队列，本地默认并发 1 |
+| T3-04 | 幂等启动 | 完成 | 本次提交 | 请求头 `Idempotency-Key` + `configDigest` 一致性校验 + 409 `IDEMPOTENCY_KEY_CONFLICT` |
 | T3-05 | 控制受理与 worker 执行确认分离 | 未开始 | | 终态 resume 返回 409 |
 | T3-06 | 启动失败、非零退出、停止超时、残留进程、槽位释放 | 未开始 | | |
 | T3-07 | 重启后未知活动任务标记 interrupted | 未开始 | | 不做精确续训 |
@@ -52,14 +52,14 @@
 ## 接口与协议变更（给成员2/4/5）
 
 - 新增/变更的 REST 接口：（T3-09 将新增 `GET /api/training/{jobId}/events`）
-- 请求头/请求体字段：支持请求头 `X-Request-Id` 透传或自动生成；（T3-04 将支持 `POST /api/training/start` 可选请求头 `Idempotency-Key`）
+- 请求头/请求体字段：支持请求头 `X-Request-Id` 透传或自动生成；`POST /api/training/start` 新增可选请求头 `Idempotency-Key`（长度 ≤ 128，同用户同键同配置幂等返回既有任务并将 `idempotentReplay` 置为 `true`；同用户同键但配置 `configDigest` 不同返回 HTTP 409 `IDEMPOTENCY_KEY_CONFLICT`）。
 - 响应字段新增（全部向后兼容保留旧字段）：
   - `TrainingStartResponse` 新增：`configDigest`、`idempotentReplay`、`queuePosition`
   - `TrainingStatusResponse` 新增：`pendingControl`、`device`、`lastSequence`、`exitCode`、`errorCode`、`errorReason`、`configDigest`、`createdAt`、`startedAt`、`updatedAt`、`finishedAt`
   - `TrainingControlResponse` 新增：`pendingControl`、`accepted`
 - 状态枚举：`queued / running / paused / completed / stopped / failed / interrupted`，配合 `pendingControl`（`pause / resume / stop / null`）表示控制请求已受理待确认；暂停默认继续占用执行槽位。
 - 事件字段：（T3-09 将统一补齐 `jobId / sequence / timestamp / schemaVersion`）
-- 错误码与错误结构（`code/message/details/requestId`，**临时约定，待成员2确认**）：`TrainingErrorResponse` 同时保留旧版 `error` 同名镜像字段，已启用 `INVALID_STATE_TRANSITION`（HTTP 409）、`TRAINING_CAPACITY_EXCEEDED`（HTTP 429）、`USER_ACTIVE_JOB_LIMIT_EXCEEDED`（HTTP 429）、`WORKER_START_FAILED`（HTTP 500）。
+- 错误码与错误结构（`code/message/details/requestId`，**临时约定，待成员2确认**）：`TrainingErrorResponse` 同时保留旧版 `error` 同名镜像字段，已启用 `INVALID_STATE_TRANSITION`（HTTP 409）、`IDEMPOTENCY_KEY_CONFLICT`（HTTP 409）、`TRAINING_CAPACITY_EXCEEDED`（HTTP 429）、`USER_ACTIVE_JOB_LIMIT_EXCEEDED`（HTTP 429）、`WORKER_START_FAILED`（HTTP 500）。
 - 成员2网络校验接入点：`com.deepvision.studio.training.NetworkValidator` 接口（默认由 `TrainingValidationConfig` 提供 `@ConditionalOnMissingBean` 放行实现；成员2只需注册自己的 `NetworkValidator` Bean 即可在创建进程与占用槽位前自动拦截非法网络）。
 - 配置项及默认值（`application.yml` 下 `deepvision.training.*`，均支持环境变量覆盖）：
   - `max-concurrent-jobs`: `1`（`DEEPVISION_TRAINING_MAX_CONCURRENT_JOBS`）
@@ -97,6 +97,7 @@
 - `backend/spring/src/test/java/com/deepvision/studio/training/ControllableTrainingProcessLauncher.java`（新增，可控模拟 worker 进程启动器）
 - `backend/spring/src/test/java/com/deepvision/studio/training/TrainingTestFixtures.java`（新增，测试数据集与请求构造辅助类）
 - `backend/spring/src/test/java/com/deepvision/studio/training/TrainingCapacityAndQueueTest.java`（新增，AC-03.2 并发/排队/容量限制单测）
+- `backend/spring/src/test/java/com/deepvision/studio/training/TrainingIdempotencyTest.java`（新增，AC-03.1 并发与顺序幂等重放、409 配置冲突及跨用户隔离单测）
 - `backend/spring/src/test/java/com/deepvision/studio/training/TrainingJobRepositoryTest.java`（新增，实体与幂等唯一约束单元测试）
 - `backend/spring/src/test/java/com/deepvision/studio/training/TrainingJobStateMachineTest.java`（新增，集中状态机与 409 校验单元测试）
 - `backend/python-training/tests/test_training_worker_control.py`（新增，worker 控制文件读取基础单测）
@@ -111,7 +112,7 @@
 
 | 验收编号 | 环境与输入 | 操作或命令 | 预期 | 实际 | 证据位置 | 结论 |
 | --- | --- | --- | --- | --- | --- | --- |
-| AC-03.1 | | 同一个幂等键提交两次 | 只有 1 个任务，最多 1 个进程 | | | 未执行 |
+| AC-03.1 | 内存 H2 + `ControllableTrainingProcessLauncher`（并发上限 1、队列上限 0），同一用户携带 `Idempotency-Key: idem-key-001` | `mvn -q test` 执行 `TrainingIdempotencyTest`（8 线程栅栏同时提交 + 顺序重试 + 异构配置冲突校验） | 只有 1 个任务，最多 1 个进程 | 数据库仅创建 1 条 `TrainingJob`，仅启动 1 个进程，所有重试返回相同 `jobId` 且 `idempotentReplay=true`；同键异配置返回 HTTP 409 `IDEMPOTENCY_KEY_CONFLICT` | `TrainingIdempotencyTest.java` | 通过 |
 | AC-03.2 | 测试配置：并发 2、队列 3、单用户上限 10，内存 H2 + `ControllableTrainingProcessLauncher` | `mvn -q test` 执行 `TrainingCapacityAndQueueTest` 6 线程栅栏并发提交 | 最多 2 个执行、3 个排队，其余收到容量错误 | 2 个 `running`（启动 2 个受管进程）、3 个 `queued`、1 个抛出 HTTP 429 `TRAINING_CAPACITY_EXCEEDED`；首个任务完成后队首自动晋升为 `running` | `TrainingCapacityAndQueueTest.java` | 通过 |
 | AC-03.3 | | 暂停 / 继续 / 停止；对已完成任务调用 resume | 经确认后才变更状态；resume 返回 409 | | | 未执行 |
 | AC-03.4 | | 强制杀掉 worker；模拟服务重启 | 状态为 failed / interrupted，并有原因 | | | 未执行 |
@@ -128,8 +129,8 @@
 
 ## 下一步（按优先级，下一个 agent 从这里开始）
 
-1. 实现 T3-04：请求头 `Idempotency-Key` 幂等启动（同用户同键同配置幂等返回、不同配置返回 HTTP 409 `IDEMPOTENCY_KEY_CONFLICT`），覆盖 AC-03.1。
-2. 实现 T3-05 ~ T3-07：控制受理与 worker 确认分离、`stopTimeout` 超时强杀、异常退出与启动失败清理、重启恢复 `interrupted`，覆盖 AC-03.3 ~ AC-03.5。
+1. 实现 T3-05：控制受理与 worker 执行确认分离（`pause/resume/stop` 仅写 `control.json` 并标记 `pendingControl`，收到 worker `control` 事件后才切换最终状态；终态调用 `resume` 返回 HTTP 409；`stop` 超时自动强杀），覆盖 AC-03.3。
+2. 实现 T3-06 ~ T3-07：启动失败/非零退出/任务超时/残留进程清理、重启恢复 `interrupted`，覆盖 AC-03.4 ~ AC-03.5。
 3. 实现 T3-08 ~ T3-09 及全链路集成测试。
 
 ## 会话日志
@@ -137,4 +138,5 @@
 - 2026-11-14 13:37：初始化。从 origin/main 建立分支，创建本交接文档，还没有改代码。
 - 2026-11-14 14:44（member3-agent）：完成现状核查与 T3-01（`TrainingJob` 实体、`TrainingJobRepository`、`spring-boot-starter-test`、`application-test.yml` 及 `TrainingJobRepositoryTest`，`mvn test` 与 `pytest` 均通过，提交 `3e154ba`）。
 - 2026-11-14 14:55（member3-agent）：完成 T3-02（`TrainingJobStatus`、`TrainingControlAction`、`TrainingJobStateMachine` 集中转换表与暂停占槽策略、统一错误契约 `TrainingErrorResponse`、`NetworkValidator` 扩展接口及单测，提交 `4249500`）。
-- 2026-11-14 15:08（member3-agent）：完成 T3-03（`TrainingProperties`、`TrainingProcessLauncher`、并发槽位与有界队列调度、`TrainingCapacityAndQueueTest` 验收 AC-03.2，`mvn test` 与 `pytest` 均通过）。
+- 2026-11-14 15:08（member3-agent）：完成 T3-03（`TrainingProperties`、`TrainingProcessLauncher`、并发槽位与有界队列调度、`TrainingCapacityAndQueueTest` 验收 AC-03.2，`mvn test` 与 `pytest` 均通过，提交 `4760840`）。
+- 2026-11-14 15:11（member3-agent）：完成 T3-04（`Idempotency-Key` 幂等启动、配置摘要冲突 409 拦截与 `TrainingIdempotencyTest` 验收 AC-03.1，`mvn test` 与 `pytest` 均通过）。

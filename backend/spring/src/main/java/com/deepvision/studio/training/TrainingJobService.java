@@ -118,7 +118,12 @@ public class TrainingJobService {
   }
 
   public TrainingStartResponse start(StartTrainingRequest request, String username) {
+    return start(request, username, null);
+  }
+
+  public TrainingStartResponse start(StartTrainingRequest request, String username, String idempotencyKey) {
     requireUser(username);
+    String normalizedKey = normalizeIdempotencyKey(idempotencyKey);
     TrainingDatasetDetail dataset = datasetService.getDetail(request.datasetId(), username);
     validateSplit(request.split());
     if (!dataset.hasLabels()) {
@@ -141,6 +146,37 @@ public class TrainingJobService {
     String jobId;
 
     synchronized (schedulerLock) {
+      if (normalizedKey != null) {
+        TrainingJob existing = jobRepository.findByOwnerAndIdempotencyKey(username, normalizedKey).orElse(null);
+        if (existing != null) {
+          if (!Objects.equals(existing.getConfigDigest(), configDigest)) {
+            Map<String, Object> details = new LinkedHashMap<>();
+            details.put("jobId", existing.getJobId());
+            details.put("idempotencyKey", normalizedKey);
+            details.put("existingConfigDigest", existing.getConfigDigest());
+            details.put("requestConfigDigest", configDigest);
+            throw new TrainingStateConflictException(
+                "IDEMPOTENCY_KEY_CONFLICT",
+                "Idempotency-Key has already been used for a different training configuration.",
+                details
+            );
+          }
+          Integer existingQueuePos = TrainingJobStatus.QUEUED.wireValue().equals(existing.getStatus())
+              ? queuePositionLocked(existing.getJobId())
+              : null;
+          return new TrainingStartResponse(
+              existing.getJobId(),
+              existing.getStatus(),
+              existing.getTotalEpochs(),
+              existing.getTotalBatches(),
+              streamUrl(existing.getJobId()),
+              existing.getConfigDigest(),
+              true,
+              existingQueuePos
+          );
+        }
+      }
+
       long userActiveCount = jobRepository.countByOwnerAndStatusIn(username, TrainingJobStatus.activeWireValues());
       int maxUserActive = properties.getMaxActiveJobsPerUser();
       if (userActiveCount >= maxUserActive) {
@@ -193,6 +229,7 @@ public class TrainingJobService {
       if (hasSlot) {
         entity.setStartedAt(now);
       }
+      entity.setIdempotencyKey(normalizedKey);
       jobRepository.saveAndFlush(entity);
 
       ManagedJobRuntime runtime = new ManagedJobRuntime(entity, request);
@@ -1193,6 +1230,31 @@ public class TrainingJobService {
     if (Math.abs(sum - 1.0) > 0.0001) {
       throw new IllegalArgumentException("split.train + split.val + split.test must equal 1.0.");
     }
+  }
+
+  private String normalizeIdempotencyKey(String rawKey) {
+    if (rawKey == null) {
+      return null;
+    }
+    String trimmed = rawKey.trim();
+    if (trimmed.isEmpty()) {
+      return null;
+    }
+    if (trimmed.length() > 128) {
+      throw new IllegalArgumentException("Idempotency-Key must not exceed 128 characters.");
+    }
+    return trimmed;
+  }
+
+  private Integer queuePositionLocked(String jobId) {
+    int pos = 1;
+    for (String queuedId : waitQueue) {
+      if (Objects.equals(queuedId, jobId)) {
+        return pos;
+      }
+      pos++;
+    }
+    return null;
   }
 
   private int valueOrDefault(Integer value, int fallback) {
