@@ -24,6 +24,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -115,6 +116,43 @@ public class TrainingJobService {
     this.jobRoot = Path.of(properties.getJobsRoot()).toAbsolutePath().normalize();
     this.pythonExecutable = properties.getPythonExecutable();
     this.workerScript = Path.of(properties.getWorkerScript()).toAbsolutePath().normalize();
+    recoverOrphanedJobsOnStartup();
+  }
+
+  @PostConstruct
+  int recoverOrphanedJobsOnStartup() {
+    int recovered = 0;
+    synchronized (schedulerLock) {
+      List<TrainingJob> orphanedCandidates =
+          jobRepository.findByStatusInOrderByCreatedAtAsc(TrainingJobStatus.activeWireValues());
+      if (orphanedCandidates == null || orphanedCandidates.isEmpty()) {
+        return 0;
+      }
+      Instant now = Instant.now();
+      for (TrainingJob job : orphanedCandidates) {
+        ManagedJobRuntime runtime = runtimes.get(job.getJobId());
+        ManagedWorkerProcess proc = runtime == null ? null : runtime.process();
+        if (proc != null && proc.isAlive()) {
+          continue;
+        }
+        TrainingJobStatus prevStatus = TrainingJobStatus.fromWireValue(job.getStatus());
+        TrainingJobStateMachine.requireTransition(job.getJobId(), prevStatus, TrainingJobStatus.INTERRUPTED);
+        activeSlotJobIds.remove(job.getJobId());
+        waitQueue.remove(job.getJobId());
+        job.setStatus(TrainingJobStatus.INTERRUPTED.wireValue());
+        job.setPendingControl(null);
+        job.setErrorCode("SERVICE_RESTART_INTERRUPTED");
+        job.setErrorReason(
+            "Service restarted while job was '" + prevStatus.wireValue()
+                + "' with no managed worker process; checkpoint resume is not supported."
+        );
+        job.setUpdatedAt(now);
+        job.setFinishedAt(now);
+        jobRepository.saveAndFlush(job);
+        recovered++;
+      }
+    }
+    return recovered;
   }
 
   public TrainingStartResponse start(StartTrainingRequest request, String username) {
@@ -681,7 +719,15 @@ public class TrainingJobService {
         return;
       }
       runtime.destroyProcessForcibly();
-      transitionJobLocked(runtime, TrainingJobStatus.FAILED, null, "JOB_TIMEOUT", reason);
+      Integer forcedExit = null;
+      if (!process.isAlive()) {
+        try {
+          forcedExit = process.exitValue();
+        } catch (IllegalThreadStateException ignored) {
+          // Process still terminating in OS.
+        }
+      }
+      transitionJobLocked(runtime, TrainingJobStatus.FAILED, forcedExit, "JOB_TIMEOUT", reason);
       releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
     }
     emitSyntheticError(runtime, "JOB_TIMEOUT", reason);
@@ -792,12 +838,14 @@ public class TrainingJobService {
           if (TrainingJobStateMachine.canTransition(current, TrainingJobStatus.COMPLETED)) {
             transitionJobLocked(runtime, TrainingJobStatus.COMPLETED, 0, null, null);
             releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
+            scheduleTerminalProcessReaper(runtime, runtime.process());
           }
         }
         case "stopped" -> {
           if (TrainingJobStateMachine.canTransition(current, TrainingJobStatus.STOPPED)) {
             transitionJobLocked(runtime, TrainingJobStatus.STOPPED, 0, null, null);
             releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
+            scheduleTerminalProcessReaper(runtime, runtime.process());
           }
         }
         default -> {
@@ -808,13 +856,29 @@ public class TrainingJobService {
     launchPromotedRuntimes(promoted);
   }
 
+  private void scheduleTerminalProcessReaper(ManagedJobRuntime runtime, ManagedWorkerProcess process) {
+    if (process == null || !process.isAlive()) {
+      return;
+    }
+    long delayMs = Math.max(50L, Math.min(500L, properties.getStopTimeout().toMillis()));
+    timerExecutor.schedule(() -> {
+      if (!shuttingDown && process.isAlive()) {
+        process.destroyForcibly();
+        runtime.clearProcessReference(process);
+      }
+    }, delayMs, TimeUnit.MILLISECONDS);
+  }
+
   private void waitForWorkerExit(ManagedJobRuntime runtime, ManagedWorkerProcess process) {
     try {
       int exitCode = process.waitFor();
+      process.destroyForcibly();
       if (shuttingDown) {
         return;
       }
       List<ManagedJobRuntime> promoted = new ArrayList<>();
+      String syntheticErrorCode = null;
+      String syntheticErrorReason = null;
       synchronized (schedulerLock) {
         if (!runtime.isCurrentProcessOrTerminated(process)) {
           return;
@@ -835,13 +899,21 @@ public class TrainingJobService {
           transitionJobLocked(runtime, TrainingJobStatus.COMPLETED, 0, null, null);
           releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
         } else {
-          String errCode = runtime.lastWorkerErrorCode() != null ? runtime.lastWorkerErrorCode() : "WORKER_NON_ZERO_EXIT";
+          String defaultCode = exitCode == 0 ? "WORKER_UNEXPECTED_EXIT" : "WORKER_NON_ZERO_EXIT";
+          String errCode = runtime.lastWorkerErrorCode() != null ? runtime.lastWorkerErrorCode() : defaultCode;
           String errReason = runtime.lastWorkerErrorMessage() != null
               ? runtime.lastWorkerErrorMessage()
               : "Training worker exited abnormally with code " + exitCode + ".";
+          if (runtime.lastWorkerErrorCode() == null) {
+            syntheticErrorCode = errCode;
+            syntheticErrorReason = errReason;
+          }
           transitionJobLocked(runtime, TrainingJobStatus.FAILED, exitCode, errCode, errReason);
           releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
         }
+      }
+      if (syntheticErrorCode != null) {
+        emitSyntheticError(runtime, syntheticErrorCode, syntheticErrorReason);
       }
       launchPromotedRuntimes(promoted);
     } catch (InterruptedException ex) {
