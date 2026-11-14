@@ -64,7 +64,7 @@ public class TrainingJobService {
   private final TrainingCheckpointRepository checkpoints;
   private final ObjectMapper objectMapper;
   private final ExecutorService executor = Executors.newCachedThreadPool();
-  private final Map<String, TrainingJob> jobs = new ConcurrentHashMap<>();
+  private final Map<String, InMemoryTrainingJob> jobs = new ConcurrentHashMap<>();
   private final Map<String, CopyOnWriteArraySet<WebSocketSession>> sessions = new ConcurrentHashMap<>();
   private final String streamBaseUrl;
   private final Path datasetRoot;
@@ -109,7 +109,7 @@ public class TrainingJobService {
     int totalBatches = Math.max(1, (int) Math.ceil(trainSamples / batchSize));
 
     String jobId = nextJobId();
-    TrainingJob job = new TrainingJob(jobId, request, username, modelSignature(request), totalEpochs, totalBatches);
+    InMemoryTrainingJob job = new InMemoryTrainingJob(jobId, request, username, modelSignature(request), totalEpochs, totalBatches);
     jobs.put(jobId, job);
     startPythonWorker(job);
     return new TrainingStartResponse(
@@ -130,7 +130,7 @@ public class TrainingJobService {
   }
 
   public WeightHistogramResponse histogram(String jobId) {
-    TrainingJob job = getJob(jobId);
+    InMemoryTrainingJob job = getJob(jobId);
     return histogram(job);
   }
 
@@ -138,7 +138,7 @@ public class TrainingJobService {
     return histogram(requireOwnedJob(username, jobId));
   }
 
-  private WeightHistogramResponse histogram(TrainingJob job) {
+  private WeightHistogramResponse histogram(InMemoryTrainingJob job) {
     TrainingMetricMessage metric = job.latestMetric();
     double mean = metric == null ? 0 : metric.weightMean();
     double std = metric == null ? 0.16 : Math.max(0.02, metric.weightStd());
@@ -152,7 +152,7 @@ public class TrainingJobService {
   }
 
   public TrainingControlResponse pause(String jobId) {
-    TrainingJob job = getJob(jobId);
+    InMemoryTrainingJob job = getJob(jobId);
     return pause(job);
   }
 
@@ -160,14 +160,14 @@ public class TrainingJobService {
     return pause(requireOwnedJob(username, jobId));
   }
 
-  private TrainingControlResponse pause(TrainingJob job) {
+  private TrainingControlResponse pause(InMemoryTrainingJob job) {
     writeControl(job, "paused");
     job.setStatus("paused");
     return new TrainingControlResponse(job.jobId(), job.status(), "Training paused.");
   }
 
   public TrainingControlResponse resume(String jobId) {
-    TrainingJob job = getJob(jobId);
+    InMemoryTrainingJob job = getJob(jobId);
     return resume(job);
   }
 
@@ -175,7 +175,7 @@ public class TrainingJobService {
     return resume(requireOwnedJob(username, jobId));
   }
 
-  private TrainingControlResponse resume(TrainingJob job) {
+  private TrainingControlResponse resume(InMemoryTrainingJob job) {
     writeControl(job, "running");
     if ("paused".equals(job.status())) {
       job.setStatus("running");
@@ -184,7 +184,7 @@ public class TrainingJobService {
   }
 
   public TrainingControlResponse stop(String jobId) {
-    TrainingJob job = getJob(jobId);
+    InMemoryTrainingJob job = getJob(jobId);
     return stop(job);
   }
 
@@ -192,7 +192,7 @@ public class TrainingJobService {
     return stop(requireOwnedJob(username, jobId));
   }
 
-  private TrainingControlResponse stop(TrainingJob job) {
+  private TrainingControlResponse stop(InMemoryTrainingJob job) {
     writeControl(job, "stopped");
     job.destroyProcess();
     job.setStatus("stopped");
@@ -200,7 +200,7 @@ public class TrainingJobService {
   }
 
   public TrainingControlResponse reset(String jobId) {
-    TrainingJob job = getJob(jobId);
+    InMemoryTrainingJob job = getJob(jobId);
     return reset(job);
   }
 
@@ -208,7 +208,7 @@ public class TrainingJobService {
     return reset(requireOwnedJob(username, jobId));
   }
 
-  private TrainingControlResponse reset(TrainingJob job) {
+  private TrainingControlResponse reset(InMemoryTrainingJob job) {
     writeControl(job, "stopped");
     job.destroyProcess();
     job.reset();
@@ -217,7 +217,7 @@ public class TrainingJobService {
   }
 
   public TrainingControlResponse save(String jobId) {
-    TrainingJob job = getJob(jobId);
+    InMemoryTrainingJob job = getJob(jobId);
     return save(job);
   }
 
@@ -225,7 +225,7 @@ public class TrainingJobService {
     return save(requireOwnedJob(username, jobId));
   }
 
-  private TrainingControlResponse save(TrainingJob job) {
+  private TrainingControlResponse save(InMemoryTrainingJob job) {
     if (job.username() == null || job.username().isBlank()) {
       throw new IllegalArgumentException("Please login before saving checkpoints.");
     }
@@ -289,7 +289,7 @@ public class TrainingJobService {
   }
 
   public void addSession(String username, String jobId, WebSocketSession session) {
-    TrainingJob job = requireOwnedJob(username, jobId);
+    InMemoryTrainingJob job = requireOwnedJob(username, jobId);
     addSession(job, session);
   }
 
@@ -297,7 +297,7 @@ public class TrainingJobService {
     addSession(getJob(jobId), session);
   }
 
-  private void addSession(TrainingJob job, WebSocketSession session) {
+  private void addSession(InMemoryTrainingJob job, WebSocketSession session) {
     sessions.computeIfAbsent(job.jobId(), ignored -> new CopyOnWriteArraySet<>()).add(session);
     List<String> recentEvents = job.recentStreamEvents();
     if (!recentEvents.isEmpty()) {
@@ -318,11 +318,11 @@ public class TrainingJobService {
 
   @PreDestroy
   void shutdown() {
-    jobs.values().forEach(TrainingJob::destroyProcess);
+    jobs.values().forEach(InMemoryTrainingJob::destroyProcess);
     executor.shutdownNow();
   }
 
-  private void startPythonWorker(TrainingJob job) {
+  private void startPythonWorker(InMemoryTrainingJob job) {
     try {
       Files.createDirectories(jobRoot);
       Files.createDirectories(job.directory());
@@ -348,7 +348,7 @@ public class TrainingJobService {
     }
   }
 
-  private void readWorkerOutput(TrainingJob job, Process process) {
+  private void readWorkerOutput(InMemoryTrainingJob job, Process process) {
     try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
       String line;
       while ((line = reader.readLine()) != null) {
@@ -364,7 +364,7 @@ public class TrainingJobService {
     }
   }
 
-  private void handleWorkerLine(TrainingJob job, String line) {
+  private void handleWorkerLine(InMemoryTrainingJob job, String line) {
     if (line.isBlank()) {
       return;
     }
@@ -417,7 +417,7 @@ public class TrainingJobService {
     }
   }
 
-  private void waitForWorkerExit(TrainingJob job, Process process) {
+  private void waitForWorkerExit(InMemoryTrainingJob job, Process process) {
     try {
       int exitCode = process.waitFor();
       if (!job.isCurrentProcess(process)) {
@@ -500,7 +500,7 @@ public class TrainingJobService {
     }
   }
 
-  private void writeControl(TrainingJob job, String command) {
+  private void writeControl(InMemoryTrainingJob job, String command) {
     try {
       Files.writeString(job.controlFile(), objectMapper.writeValueAsString(Map.of("command", command)), StandardCharsets.UTF_8);
     } catch (IOException ex) {
@@ -508,8 +508,8 @@ public class TrainingJobService {
     }
   }
 
-  private TrainingJob getJob(String jobId) {
-    TrainingJob job = jobs.get(jobId);
+  private InMemoryTrainingJob getJob(String jobId) {
+    InMemoryTrainingJob job = jobs.get(jobId);
     if (job == null) {
       throw new IllegalArgumentException("Training job not found.");
     }
@@ -522,16 +522,16 @@ public class TrainingJobService {
     }
   }
 
-  private TrainingJob requireOwnedJob(String username, String jobId) {
+  private InMemoryTrainingJob requireOwnedJob(String username, String jobId) {
     requireUser(username);
-    TrainingJob job = getJob(jobId);
+    InMemoryTrainingJob job = getJob(jobId);
     if (job.username() == null || !job.username().equals(username)) {
       throw new IllegalArgumentException("Training job not found.");
     }
     return job;
   }
 
-  private TrainingCheckpoint saveCheckpoint(TrainingJob job, JsonNode testResult) {
+  private TrainingCheckpoint saveCheckpoint(InMemoryTrainingJob job, JsonNode testResult) {
     AppUser user = users.findByUsername(job.username())
         .orElseThrow(() -> new IllegalArgumentException("User not found."));
     if (!Files.exists(job.checkpointFile())) {
@@ -836,7 +836,7 @@ public class TrainingJobService {
     return null;
   }
 
-  private final class TrainingJob {
+  private final class InMemoryTrainingJob {
     private final String jobId;
     private final StartTrainingRequest request;
     private final String username;
@@ -856,7 +856,7 @@ public class TrainingJobService {
     private final ArrayDeque<String> recentStreamEvents = new ArrayDeque<>();
     private final ArrayDeque<TrainingMetricMessage> metricHistory = new ArrayDeque<>();
 
-    private TrainingJob(String jobId, StartTrainingRequest request, String username, String modelSignature, int totalEpochs, int totalBatches) {
+    private InMemoryTrainingJob(String jobId, StartTrainingRequest request, String username, String modelSignature, int totalEpochs, int totalBatches) {
       this.jobId = jobId;
       this.request = request;
       this.username = username;

@@ -5,8 +5,8 @@
 ## 基本信息
 
 - 分支：`feature/member3-training-job-control`（基于 `origin/main` @ `32a7d80`）
-- 最近更新：2026-11-14 13:37（初始化）
-- 当前状态：未开始（分支与交接文档已建立，尚无代码改动）
+- 最近更新：2026-11-14 14:44 by member3-agent
+- 当前状态：进行中（已完成 T3-01，正在推进 T3-02 ~ T3-09）
 - PR：未创建
 - 任务依据：《DeepVision Studio 五人小组任务分工与验收安排》第 6 节（成员3），只做 P0，不做 P1
 
@@ -14,60 +14,65 @@
 
 | 编号 | 内容 | 状态 | 相关提交 | 备注 |
 | --- | --- | --- | --- | --- |
-| T3-01 | 持久化任务（实体 + Repository） | 未开始 | | |
-| T3-02 | 状态机与转换规则、暂停资源策略 | 未开始 | | |
+| T3-01 | 持久化任务（实体 + Repository） | 完成 | 本次提交 | `TrainingJob` + `TrainingJobRepository` + `application-test.yml` |
+| T3-02 | 状态机与转换规则、暂停资源策略 | 未开始 | | 下一步：集中转换表 + `pendingControl` + 错误契约 |
 | T3-03 | 并发 / 用户活动数 / 队列长度 / 超时配置 | 未开始 | | 本地默认并发 1 |
-| T3-04 | 幂等启动 | 未开始 | | |
+| T3-04 | 幂等启动 | 未开始 | | 拟使用请求头 `Idempotency-Key` |
 | T3-05 | 控制受理与 worker 执行确认分离 | 未开始 | | 终态 resume 返回 409 |
 | T3-06 | 启动失败、非零退出、停止超时、残留进程、槽位释放 | 未开始 | | |
 | T3-07 | 重启后未知活动任务标记 interrupted | 未开始 | | 不做精确续训 |
 | T3-08 | 实际设备上报、友好的 OOM 提示、CPU 路径 | 未开始 | | |
 | T3-09 | 事件 `jobId/sequence/timestamp/schemaVersion`，以及状态和历史查询 | 未开始 | | |
 
-## 现状核查（基于 main @ 32a7d80，供参考，开始前请再确认）
+## 现状核查（已复核，基于 main @ 32a7d80）
 
-- `backend/spring/.../training/TrainingJobService.java`（约 1045 行）
-  - 任务只保存在内存里的 `ConcurrentHashMap<String, TrainingJob> jobs` 中，服务重启后丢失。
-  - `start()` 直接用 `ProcessBuilder` 为每个任务启动一个 `training_worker.py`，没有并发上限和队列，也没有幂等。
-  - `pause/resume/stop` 只调用 `writeControl(job, "...")` 写 controlFile，然后立即修改并返回状态，没有等 worker 确认。
-  - `stop/reset` 直接调用 `destroyProcess()`；`@PreDestroy` 销毁全部进程。
-- `TrainingController.java`：`/api/training/start`，以及 `/{jobId}/status|pause|resume|stop|reset|save|weights/histogram`。
-- `TrainingStreamHandler.java` / `TrainingWebSocketConfig.java`：WebSocket `/api/training/stream`。
-- `backend/python-training/training_worker.py`（约 1398 行）
-  - 用 `read_control` / `wait_if_paused` 轮询 controlFile（JSON）。
-  - stdout 输出 JSON 事件：`metric / backprop / test_result / control / error`。
-  - 设备：`torch.device("cuda" if torch.cuda.is_available() else "cpu")`，未上报给后端。
-- 测试：没有 `backend/spring/src/test` 目录；`pom.xml` 中未见 `spring-boot-starter-test`。
-- 技术栈：Spring Boot 3.3.5、Java 17、Maven、H2、JJWT 0.12.6。
+- `backend/spring/.../training/TrainingJobService.java`（1045 行）
+  - 任务原保存在内存 `ConcurrentHashMap` 中，服务重启丢失；内部类原名 `TrainingJob`，已在 T3-01 中重命名为 `InMemoryTrainingJob`，为 JPA 实体 `TrainingJob` 让出类名，后续在 T3-03 中统一替换为持久化编排。
+  - `start()` 直接用 `ProcessBuilder` 启动 `training_worker.py`，无并发上限、队列和幂等。
+  - `pause/resume/stop` 只写 `control.json` 后立即改状态，未等待 worker 确认。
+  - `metric` 事件在 `epoch >= totalEpochs` 时过早将状态改为 `completed`（早于 `test_result` 和 `checkpoint.pt` 落盘），将在状态机改造中修正为以 worker `control(completed)` 为准。
+- `TrainingCollaborationHandler.java`：握手时调用 `jobService.status(jobId)` 并捕获 `IllegalArgumentException` 关闭非法连接，任务不存在异常需保持向后兼容。
+- `backend/python-training/training_worker.py`（1398 行）：`wait_if_paused` 未输出 `paused`/`running` 确认事件，且 batch 内 `stopped` break 后仍会继续后续验证与保存逻辑，将在 T3-08 中一并修复控制循环。
+- `frontend/src/app/shared/training/training-runtime.service.ts`：前端通过 `body.message ?? body.error` 解析 HTTP 错误，通过 `status/message/type` 解析控制响应与 WebSocket 事件。
 
 ## 协作边界
 
-- 成员2：网络校验、模型构建、协议解析（包括 `training_worker.py` 的模型与协议部分、`TrainingDtos.java` 的网络字段）。本分支只在创建进程前预留校验接口。
+- 成员2：网络校验、模型构建、协议解析（包括 `training_worker.py` 的模型与协议部分、`TrainingDtos.java` 的网络字段）。本分支只在创建进程前预留 `NetworkValidator` 校验接口，不修改模型构建与协议解析代码。
 - 成员4：前端 `frontend/`。本分支不改前端；响应和事件只新增字段，不删除也不重命名已有字段。
-- 成员5：测试基础设施与 CI。本分支加入的测试依赖或测试配置要在下文登记。
+- 成员5：测试基础设施与 CI。本分支在 `backend/spring/pom.xml` 中加入了 `<scope>test</scope>` 的 `spring-boot-starter-test`，并新增 `src/test/resources/application-test.yml`（内存 H2 + 临时目录隔离），供成员5统一纳管。
 
 ## 设计决策（含原因，按时间追加）
 
-- （暂无）
+1. **2026-11-14（T3-01 实体与幂等唯一约束）**：新增 `TrainingJob` 实体（表 `training_jobs`），以 `jobId` 为主键，包含 `owner`、`datasetId`、`configDigest`、`status`、`pendingControl`、`createdAt/startedAt/updatedAt/finishedAt`、`lastSequence`、`exitCode`、`errorCode/errorReason`、`device`、`idempotencyKey` 及最新指标快照。为避免 H2 多列唯一索引在 `(owner_username, NULL)` 场景下的潜在冲突，额外维护派生单列唯一键 `idempotencyScopeKey = owner + ":" + idempotencyKey`（无幂等键时为 `null`），既保证无幂等键时同用户可无限提交，又在数据库层严格保证同用户同幂等键唯一、跨用户互不干扰。
+2. **2026-11-14（T3-02 状态机与过渡态方案预告）**：主状态固定为 `queued / running / paused / completed / stopped / failed / interrupted` 七种，采用独立的 `pendingControl` 字段（取值 `"pause" | "resume" | "stop" | null`）表达「控制请求已受理、等待 worker 确认」，而不是将 `status` 改为前端未知的 `pausing/stopping` 字符串，以最大化保持与现有 Angular `TrainingRuntimeService` 的向后兼容。
+3. **2026-11-14（T3-02 暂停资源策略预告）**：默认 `paused` 状态的任务**继续占用执行槽位**（可通过配置项 `deepvision.training.release-slot-on-pause=false` 控制），原因是暂停期间 Python/PyTorch 子进程仍驻留内存/显存持有模型参数与优化器状态，若释放槽位启动新训练极易导致显存溢出（OOM）。
+4. **2026-11-14（T3-04 幂等键传递方式预告）**：选择通过 HTTP 请求头 `Idempotency-Key` 传入幂等键，避免修改与成员2共用的 `StartTrainingRequest` 请求体结构减少合并冲突。
 
 ## 接口与协议变更（给成员2/4/5）
 
-- 新增/变更的 REST 接口：（暂无）
-- 请求头/请求体字段（如幂等键）：（暂无）
-- 状态枚举：（暂无）
-- 事件字段：（暂无）
-- 错误码与错误结构（`code/message/details/requestId`，由成员2牵头，此处只记录临时约定）：（暂无）
-- 配置项及默认值：（暂无）
+- 新增/变更的 REST 接口：（T3-09 将新增 `GET /api/training/{jobId}/events`）
+- 请求头/请求体字段：（T3-04 将支持 `POST /api/training/start` 可选请求头 `Idempotency-Key`）
+- 状态枚举：（T3-02 将引入 `queued / running / paused / completed / stopped / failed / interrupted` + `pendingControl`）
+- 事件字段：（T3-09 将统一补齐 `jobId / sequence / timestamp / schemaVersion`）
+- 错误码与错误结构（`code/message/details/requestId`，临时约定，待成员2确认）：（T3-02 引入）
+- 配置项及默认值：（T3-03 引入；测试环境配置见 `backend/spring/src/test/resources/application-test.yml`）
 
 ## 改动文件清单
 
-- `docs/handoff/member3-training-jobs.md`（新增，本文档）
+- `docs/handoff/member3-training-jobs.md`（更新）
+- `backend/spring/pom.xml`（新增 test 作用域 `spring-boot-starter-test`，需成员5知悉）
+- `backend/spring/src/test/resources/application-test.yml`（新增，内存 H2 与临时目录测试配置，需成员5知悉）
+- `backend/spring/src/main/java/com/deepvision/studio/training/TrainingJob.java`（新增，JPA 持久化实体）
+- `backend/spring/src/main/java/com/deepvision/studio/training/TrainingJobRepository.java`（新增，JPA Repository）
+- `backend/spring/src/main/java/com/deepvision/studio/training/TrainingJobService.java`（重命名私有内部类 `TrainingJob` -> `InMemoryTrainingJob` 消除命名冲突）
+- `backend/spring/src/test/java/com/deepvision/studio/training/TrainingJobRepositoryTest.java`（新增，实体与幂等唯一约束单元测试）
+- `backend/python-training/tests/test_training_worker_control.py`（新增，worker 控制文件读取基础单测）
 
 ## 运行与测试方法
 
-- Java：`cd backend/spring; mvn -q test`
-- Python：`cd backend/python-training; python -m pytest`（测试文件位置待定）
-- 实际执行结果记录在下方「验收记录」中。
+- Java：`cd backend/spring; mvn -q test`（当前本地环境中 Maven 安装于会话临时目录，使用 OpenJDK 21 按 Java 17 目标编译运行）
+- Python：`cd backend/python-training; .\.venv\Scripts\python.exe -m pytest tests -q`
+- 实际执行结果记录在下方「验收记录」与「会话日志」中。
 
 ## 验收记录
 
@@ -83,16 +88,18 @@
 
 ## 已知问题 / 风险 / 待确认事项
 
-- 错误结构和 `schemaVersion` 规则需要与成员2确认。
-- 新增的状态值（包括 pausing/stopping 等过渡状态）需要与成员4确认前端如何展示。
-- pom.xml 加入测试依赖的方式需要与成员5确认。
+- 错误结构 `{ code, message, details, requestId }` 和 `schemaVersion`（暂定 `"1.0"`）规则为训练模块临时约定，需要与成员2最终对齐。
+- 新增的状态值（`queued`、`failed`、`interrupted`）及 `pendingControl` 字段需要与成员4确认前端展示方式。
+- `pom.xml` 加入 `spring-boot-starter-test` 及 `application-test.yml` 的方式需要与成员5统一纳管。
+- 当前开发机全局 PATH 中未预装 `mvn` 与 `gh`，测试通过本地 JDK (`D:\Android\jbr`) + 临时目录 Apache Maven 3.9.9 与 Python 3.12 (`D:\Python`) 虚拟环境执行。
 
 ## 下一步（按优先级，下一个 agent 从这里开始）
 
-1. 阅读 `CLAUDE.md`、`docs/development-document.md`、`TrainingJobService.java`、`TrainingController.java`、`training_worker.py` 的控制部分，核对上面的「现状核查」。
-2. 设计任务实体和状态转换表，写进「设计决策」。
-3. 按提示词第 6 节的顺序小步实现并提交。
+1. 实现 T3-02：`TrainingJobStatus`、`TrainingControlAction`、集中状态转换表 `TrainingJobStateMachine`、暂停槽位策略、统一错误结构 `TrainingErrorResponse` / `TrainingApiException`、预留给成员2的 `NetworkValidator` 接口及单元测试。
+2. 实现 T3-03：`TrainingProperties` 容量与超时配置、`TrainingProcessLauncher` 抽象、全局并发槽位 + 用户活动任务数上限 + 有界等待队列，覆盖 AC-03.2。
+3. 依次完成 T3-04 ~ T3-09 与全套验收测试。
 
 ## 会话日志
 
 - 2026-11-14 13:37：初始化。从 origin/main 建立分支，创建本交接文档，还没有改代码。
+- 2026-11-14 14:44（member3-agent）：阅读 `CLAUDE.md`、`docs/development-document.md` 及现有 Spring/Python/Angular 训练相关源码完成现状核查；完成 T3-01（`TrainingJob` 实体、`TrainingJobRepository`、`spring-boot-starter-test`、`application-test.yml` 及 `TrainingJobRepositoryTest`）。

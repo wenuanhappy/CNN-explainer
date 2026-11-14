@@ -1,0 +1,40 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:deepvision_test;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  h2:
+    console:
+      enabled: false
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: false
+
+deepvision:
+  jwt:
+    secret: test-only-secret-key-with-at-least-32-characters-long
+    expiration-minutes: 60
+  uploads:
+    root: ${java.io.tmpdir}/deepvision-test-uploads
+  datasets:
+    root: ${java.io.tmpdir}/deepvision-test-datasets
+  forward:
+    base-url: http://127.0.0.1:15000
+    connect-timeout-seconds: 2
+    read-timeout-seconds: 5
+  training:
+    stream-base-url:
+    jobs-root: ${java.io.tmpdir}/deepvision-test-training-jobs
+    python-executable: python
+    worker-script: ../python-training/training_worker.py
+  llm:
+    ark-base-url: http://127.0.0.1:18081
+    ark-api-key:
+    default-model: test-model
+    connect-timeout-seconds: 2
+    read-timeout-seconds: 5
