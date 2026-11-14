@@ -306,53 +306,73 @@ public class TrainingJobService {
   }
 
   public TrainingControlResponse pause(String jobId) {
-    return pause(requireRuntime(jobId));
+    return pause(resolveRuntimeForControl(jobId, TrainingControlAction.PAUSE));
   }
 
   public TrainingControlResponse pause(String username, String jobId) {
-    return pause(requireOwnedRuntime(username, jobId));
+    return pause(resolveOwnedRuntimeForControl(username, jobId, TrainingControlAction.PAUSE));
   }
 
   private TrainingControlResponse pause(ManagedJobRuntime runtime) {
+    String statusSnapshot;
     synchronized (schedulerLock) {
       TrainingJobStateMachine.validateControlRequest(
           runtime.jobId(), runtime.statusEnum(), runtime.pendingControlEnum(), TrainingControlAction.PAUSE
       );
       writeControl(runtime, "paused");
-      transitionJobLocked(runtime, TrainingJobStatus.PAUSED, null, null, null);
+      runtime.entity().setPendingControl(TrainingControlAction.PAUSE.wireValue());
+      runtime.entity().setUpdatedAt(Instant.now());
+      jobRepository.saveAndFlush(runtime.entity());
+      statusSnapshot = runtime.status();
     }
-    return new TrainingControlResponse(runtime.jobId(), runtime.status(), "Training paused.", null, true);
+    return new TrainingControlResponse(
+        runtime.jobId(),
+        statusSnapshot,
+        "Pause request accepted; waiting for worker confirmation.",
+        TrainingControlAction.PAUSE.wireValue(),
+        true
+    );
   }
 
   public TrainingControlResponse resume(String jobId) {
-    return resume(requireRuntime(jobId));
+    return resume(resolveRuntimeForControl(jobId, TrainingControlAction.RESUME));
   }
 
   public TrainingControlResponse resume(String username, String jobId) {
-    return resume(requireOwnedRuntime(username, jobId));
+    return resume(resolveOwnedRuntimeForControl(username, jobId, TrainingControlAction.RESUME));
   }
 
   private TrainingControlResponse resume(ManagedJobRuntime runtime) {
+    String statusSnapshot;
     synchronized (schedulerLock) {
       TrainingJobStateMachine.validateControlRequest(
           runtime.jobId(), runtime.statusEnum(), runtime.pendingControlEnum(), TrainingControlAction.RESUME
       );
       writeControl(runtime, "running");
-      transitionJobLocked(runtime, TrainingJobStatus.RUNNING, null, null, null);
+      runtime.entity().setPendingControl(TrainingControlAction.RESUME.wireValue());
+      runtime.entity().setUpdatedAt(Instant.now());
+      jobRepository.saveAndFlush(runtime.entity());
+      statusSnapshot = runtime.status();
     }
-    return new TrainingControlResponse(runtime.jobId(), runtime.status(), "Training resumed.", null, true);
+    return new TrainingControlResponse(
+        runtime.jobId(),
+        statusSnapshot,
+        "Resume request accepted; waiting for worker confirmation.",
+        TrainingControlAction.RESUME.wireValue(),
+        true
+    );
   }
 
   public TrainingControlResponse stop(String jobId) {
-    return stop(requireRuntime(jobId));
+    return stop(resolveRuntimeForControl(jobId, TrainingControlAction.STOP));
   }
 
   public TrainingControlResponse stop(String username, String jobId) {
-    return stop(requireOwnedRuntime(username, jobId));
+    return stop(resolveOwnedRuntimeForControl(username, jobId, TrainingControlAction.STOP));
   }
 
   private TrainingControlResponse stop(ManagedJobRuntime runtime) {
-    List<ManagedJobRuntime> promoted = new ArrayList<>();
+    String statusSnapshot;
     synchronized (schedulerLock) {
       TrainingJobStateMachine.validateControlRequest(
           runtime.jobId(), runtime.statusEnum(), runtime.pendingControlEnum(), TrainingControlAction.STOP
@@ -360,15 +380,24 @@ public class TrainingJobService {
       if (runtime.statusEnum() == TrainingJobStatus.QUEUED) {
         waitQueue.remove(runtime.jobId());
         transitionJobLocked(runtime, TrainingJobStatus.STOPPED, null, null, "Stopped while queued.");
-        return new TrainingControlResponse(runtime.jobId(), runtime.status(), "Training stopped.", null, true);
+        return new TrainingControlResponse(runtime.jobId(), runtime.status(), "Queued training job stopped.", null, true);
       }
-      writeControl(runtime, "stopped");
-      runtime.destroyProcessForcibly();
-      transitionJobLocked(runtime, TrainingJobStatus.STOPPED, null, null, null);
-      releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
+      if (runtime.pendingControlEnum() != TrainingControlAction.STOP) {
+        writeControl(runtime, "stopped");
+        runtime.entity().setPendingControl(TrainingControlAction.STOP.wireValue());
+        runtime.entity().setUpdatedAt(Instant.now());
+        jobRepository.saveAndFlush(runtime.entity());
+        scheduleStopTimeout(runtime, runtime.process());
+      }
+      statusSnapshot = runtime.status();
     }
-    launchPromotedRuntimes(promoted);
-    return new TrainingControlResponse(runtime.jobId(), runtime.status(), "Training stopped.", null, true);
+    return new TrainingControlResponse(
+        runtime.jobId(),
+        statusSnapshot,
+        "Stop request accepted; waiting for worker confirmation.",
+        TrainingControlAction.STOP.wireValue(),
+        true
+    );
   }
 
   public TrainingControlResponse reset(String jobId) {
@@ -598,6 +627,49 @@ public class TrainingJobService {
     runtime.setJobTimeoutFuture(future);
   }
 
+  private void scheduleStopTimeout(ManagedJobRuntime runtime, ManagedWorkerProcess process) {
+    Duration timeout = properties.getStopTimeout();
+    if (timeout == null || timeout.isZero() || timeout.isNegative()) {
+      timeout = Duration.ofMillis(1);
+    }
+    final Duration effectiveTimeout = timeout;
+    ScheduledFuture<?> future = timerExecutor.schedule(
+        () -> onStopTimeout(runtime, process, effectiveTimeout),
+        effectiveTimeout.toMillis(),
+        TimeUnit.MILLISECONDS
+    );
+    runtime.setStopTimeoutFuture(future);
+  }
+
+  private void onStopTimeout(ManagedJobRuntime runtime, ManagedWorkerProcess process, Duration timeout) {
+    if (shuttingDown) {
+      return;
+    }
+    List<ManagedJobRuntime> promoted = new ArrayList<>();
+    String reason = "Worker did not confirm stop within " + timeout + "; forcibly terminated.";
+    synchronized (schedulerLock) {
+      if (runtime.statusEnum().isTerminal() || runtime.pendingControlEnum() != TrainingControlAction.STOP) {
+        return;
+      }
+      if (process != null && !runtime.isCurrentProcessOrTerminated(process)) {
+        return;
+      }
+      runtime.destroyProcessForcibly();
+      Integer forcedExit = null;
+      if (process != null && !process.isAlive()) {
+        try {
+          forcedExit = process.exitValue();
+        } catch (IllegalThreadStateException ignored) {
+          // Process still terminating in OS.
+        }
+      }
+      transitionJobLocked(runtime, TrainingJobStatus.STOPPED, forcedExit, "STOP_TIMEOUT", reason);
+      releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
+    }
+    emitSyntheticControl(runtime, "stopped", reason);
+    launchPromotedRuntimes(promoted);
+  }
+
   private void onJobTimeout(ManagedJobRuntime runtime, ManagedWorkerProcess process, Duration timeout) {
     if (shuttingDown || !runtime.isCurrentProcess(process)) {
       return;
@@ -699,13 +771,21 @@ public class TrainingJobService {
       }
       switch (workerStatus) {
         case "paused" -> {
-          if (TrainingJobStateMachine.canTransition(current, TrainingJobStatus.PAUSED)) {
-            transitionJobLocked(runtime, TrainingJobStatus.PAUSED, null, null, null);
+          if (current == TrainingJobStatus.RUNNING
+              && TrainingJobStateMachine.canTransition(current, TrainingJobStatus.PAUSED)) {
+            String nextPending = runtime.pendingControlEnum() == TrainingControlAction.STOP
+                ? TrainingControlAction.STOP.wireValue()
+                : null;
+            transitionJobWithPendingLocked(runtime, TrainingJobStatus.PAUSED, nextPending, null, null, null);
           }
         }
         case "running" -> {
-          if (TrainingJobStateMachine.canTransition(current, TrainingJobStatus.RUNNING)) {
-            transitionJobLocked(runtime, TrainingJobStatus.RUNNING, null, null, null);
+          if (current == TrainingJobStatus.PAUSED
+              && TrainingJobStateMachine.canTransition(current, TrainingJobStatus.RUNNING)) {
+            String nextPending = runtime.pendingControlEnum() == TrainingControlAction.STOP
+                ? TrainingControlAction.STOP.wireValue()
+                : null;
+            transitionJobWithPendingLocked(runtime, TrainingJobStatus.RUNNING, nextPending, null, null, null);
           }
         }
         case "completed" -> {
@@ -748,7 +828,10 @@ public class TrainingJobService {
             jobRepository.saveAndFlush(runtime.entity());
           }
           releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
-        } else if (exitCode == 0 && current == TrainingJobStatus.RUNNING) {
+        } else if (exitCode == 0 && runtime.pendingControlEnum() == TrainingControlAction.STOP) {
+          transitionJobLocked(runtime, TrainingJobStatus.STOPPED, 0, null, null);
+          releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
+        } else if (exitCode == 0 && current == TrainingJobStatus.RUNNING && runtime.pendingControlEnum() == null) {
           transitionJobLocked(runtime, TrainingJobStatus.COMPLETED, 0, null, null);
           releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
         } else {
@@ -773,6 +856,17 @@ public class TrainingJobService {
       String errorCode,
       String errorReason
   ) {
+    transitionJobWithPendingLocked(runtime, targetStatus, null, exitCode, errorCode, errorReason);
+  }
+
+  private void transitionJobWithPendingLocked(
+      ManagedJobRuntime runtime,
+      TrainingJobStatus targetStatus,
+      String pendingControl,
+      Integer exitCode,
+      String errorCode,
+      String errorReason
+  ) {
     TrainingJobStatus current = runtime.statusEnum();
     if (current != targetStatus) {
       TrainingJobStateMachine.requireTransition(runtime.jobId(), current, targetStatus);
@@ -780,7 +874,7 @@ public class TrainingJobService {
     Instant now = Instant.now();
     TrainingJob entity = runtime.entity();
     entity.setStatus(targetStatus.wireValue());
-    entity.setPendingControl(null);
+    entity.setPendingControl(targetStatus.isTerminal() ? null : pendingControl);
     entity.setUpdatedAt(now);
     if (exitCode != null) {
       entity.setExitCode(exitCode);
@@ -824,6 +918,17 @@ public class TrainingJobService {
     for (ManagedJobRuntime next : promoted) {
       launchWorkerForSlotOwner(next, false);
     }
+  }
+
+  private void emitSyntheticControl(ManagedJobRuntime runtime, String status, String message) {
+    ObjectNode node = objectMapper.createObjectNode();
+    node.put("type", "control");
+    node.put("jobId", runtime.jobId());
+    node.put("status", status);
+    node.put("message", message);
+    String payload = node.toString();
+    runtime.addStreamEvent(payload);
+    broadcastRaw(runtime.jobId(), payload);
   }
 
   private void emitSyntheticError(ManagedJobRuntime runtime, String errorCode, String message) {
@@ -888,6 +993,42 @@ public class TrainingJobService {
     } catch (IOException ex) {
       throw new IllegalArgumentException("Failed to update training control file.");
     }
+  }
+
+  private ManagedJobRuntime resolveRuntimeForControl(String jobId, TrainingControlAction action) {
+    ManagedJobRuntime runtime = runtimes.get(jobId);
+    if (runtime != null) {
+      return runtime;
+    }
+    TrainingJob entity = jobRepository.findById(jobId)
+        .orElseThrow(() -> new IllegalArgumentException("Training job not found."));
+    TrainingJobStateMachine.validateControlRequest(
+        entity.getJobId(),
+        TrainingJobStatus.fromWireValue(entity.getStatus()),
+        TrainingControlAction.fromNullableWireValue(entity.getPendingControl()),
+        action
+    );
+    throw new IllegalArgumentException("Training job runtime is not active.");
+  }
+
+  private ManagedJobRuntime resolveOwnedRuntimeForControl(String username, String jobId, TrainingControlAction action) {
+    requireUser(username);
+    ManagedJobRuntime runtime = runtimes.get(jobId);
+    if (runtime != null) {
+      if (runtime.owner() == null || !runtime.owner().equals(username)) {
+        throw new IllegalArgumentException("Training job not found.");
+      }
+      return runtime;
+    }
+    TrainingJob entity = jobRepository.findByJobIdAndOwner(jobId, username)
+        .orElseThrow(() -> new IllegalArgumentException("Training job not found."));
+    TrainingJobStateMachine.validateControlRequest(
+        entity.getJobId(),
+        TrainingJobStatus.fromWireValue(entity.getStatus()),
+        TrainingControlAction.fromNullableWireValue(entity.getPendingControl()),
+        action
+    );
+    throw new IllegalArgumentException("Training job runtime is not active.");
   }
 
   private ManagedJobRuntime requireRuntime(String jobId) {
@@ -1339,6 +1480,7 @@ public class TrainingJobService {
     private volatile boolean checkpointSaved;
     private volatile ManagedWorkerProcess process;
     private volatile ScheduledFuture<?> jobTimeoutFuture;
+    private volatile ScheduledFuture<?> stopTimeoutFuture;
     private volatile String lastWorkerErrorCode;
     private volatile String lastWorkerErrorMessage;
     private final ArrayDeque<String> recentStreamEvents = new ArrayDeque<>();
@@ -1477,6 +1619,11 @@ public class TrainingJobService {
       if (jf != null) {
         jf.cancel(false);
       }
+      ScheduledFuture<?> sf = stopTimeoutFuture;
+      stopTimeoutFuture = null;
+      if (sf != null) {
+        sf.cancel(false);
+      }
     }
 
     private boolean isCurrentProcess(ManagedWorkerProcess candidate) {
@@ -1518,6 +1665,13 @@ public class TrainingJobService {
     private ManagedWorkerProcess process() { return process; }
     private void setProcess(ManagedWorkerProcess process) { this.process = process; }
     private void setJobTimeoutFuture(ScheduledFuture<?> future) { this.jobTimeoutFuture = future; }
+    private void setStopTimeoutFuture(ScheduledFuture<?> future) {
+      ScheduledFuture<?> prev = this.stopTimeoutFuture;
+      this.stopTimeoutFuture = future;
+      if (prev != null) {
+        prev.cancel(false);
+      }
+    }
     private String lastWorkerErrorCode() { return lastWorkerErrorCode; }
     private String lastWorkerErrorMessage() { return lastWorkerErrorMessage; }
   }
