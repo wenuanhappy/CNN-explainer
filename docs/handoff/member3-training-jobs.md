@@ -5,9 +5,9 @@
 ## 基本信息
 
 - 分支：`feature/member3-training-job-control`（基于 `origin/main` @ `32a7d80`）
-- 最近更新：2026-11-14 16:00 by member3-agent
-- 当前状态：待评审（本地分支已完成 T3-01 ~ T3-09 与 AC-03.1 ~ AC-03.5 全部提交并通过 19 项 Java + 7 项 Python 测试；后台非交互 `git push` 等待 GitHub HTTPS 凭据弹窗阻塞且本机无 `gh` CLI，已按规范停止并附上手动推送与提 PR 命令）
-- PR：待手动推送分支并创建（见下方「下一步」）
+- 最近更新：2026-11-14 17:00 by member3-followup-agent
+- 当前状态：评审修复全部完成，待手动推送更新远程分支与 PR（已完成 T3-01 ~ T3-09 及评审项 B1 ~ B3、S1 ~ S4、全部 5 项次要项；28 项 Java 测试 + 7 项 Python 测试全部通过；按用户指示最后一步由用户手动执行 `git push`）
+- PR：**必须与成员4的前端适配一起合并，或在成员4的前端适配之后合并**（见下方「合并前置条件：前端适配清单（交给成员4）」与「PR 描述补充」）
 - 任务依据：《DeepVision Studio 五人小组任务分工与验收安排》第 6 节（成员3），只做 P0，不做 P1
 
 ## 任务进度
@@ -30,12 +30,12 @@
 | --- | --- | --- | --- | --- |
 | B1 | `reset()` 竞态（`runGeneration` 进程代数）与终态新建任务语义（方案A） | 完成 | `1307287` | 移除 `isCurrentProcessOrTerminated` 的 `null` 误判，改用单调 `runGeneration` 校验回调；`reset` 仅允许终态任务并复用原请求走 `start` 创建新 `jobId`（非终态返 409、保留原 `checkpoint.pt`） |
 | B2 | `launchWorkerForSlotOwner()` 捕获 `RuntimeException` 释放槽位并晋升队列 | 完成 | `2c04439` | 捕获 `IOException \| RuntimeException`，统一转 `failed`（`WORKER_START_FAILED`）、发出合成 `error` 事件、释放槽位并自动晋升排队任务 |
-| B3 | 交接文档与 PR 描述补充成员4前端适配清单（合并前置条件） | 未开始 | | |
+| B3 | 交接文档与 PR 描述补充成员4前端适配清单（合并前置条件） | 完成 | 本次提交 | 新增「合并前置条件：前端适配清单（交给成员4）」与可直接复制的「PR 描述补充」，明确合并顺序约束，未修改 `frontend/` |
 | S1 | 接入 `release-slot-on-pause` 配置（暂停释放槽位、恢复重申槽位/排队） | 完成 | `32254a7` | 接入 `TrainingJobStateMachine.occupiesExecutionSlot`：`true` 时确认暂停后释放槽位并晋升排队任务，`resume` 时重申槽位（无空闲槽位返 429 `TRAINING_CAPACITY_EXCEEDED` / `resume_slot_unavailable`） |
 | S2 | `jobTimeout` 仅累计实际运行时间（暂停停止计时、恢复续计） | 完成 | `a396323` | 基于单调时钟 `System.nanoTime()` 记录 `remainingJobTimeoutNanos`，`paused` 确认时扣减已运行耗时并取消定时器，`running` 恢复确认后按剩余额度重新计时 |
 | S3 | 事件持久化减少锁内 DB 写入与按间隔批量裁剪历史事件 | 完成 | `ff3fafd` | 在 `schedulerLock` 内仅分配单调 `sequence` 与更新内存环形缓冲，`TrainingJobEvent` 插入与批量裁剪移至单任务 `persistenceLock` 锁外执行；流式事件每 16 条才 flush 一次 `TrainingJob`，历史表按溢出阈值 16 条（及终态/按需读取时）批量裁剪 |
 | S4 | 恢复 `TrainingJobService.java` 与 `application.yml` 的 `i/crlf` 换行符 | 完成 | `b4b8790` | 消除约 1490 行纯换行符虚增 diff |
-| 次要项 | 启动恢复单次执行、真实 `exitCode` 回写、终态内存清理、幂等前置校验、Python 路径冲突提示 | 完成 | 本次提交 | 移除重复 `@PostConstruct`；`completed/stopped` 确认不再硬编码 `0`，在 `waitForWorkerExit` 写入真实 OS `exitCode`；终态延迟 `terminal-runtime-retention`（默认 `10m`）移除内存 `ManagedJobRuntime` 并全路径回退 H2；幂等查找前置到 `datasetService.getDetail` 之前；补充成员1 `T1-03` Python 路径合并冲突说明 |
+| 次要项 | 启动恢复单次执行、真实 `exitCode` 回写、终态内存清理、幂等前置校验、Python 路径冲突提示 | 完成 | `3e0336e` | 移除重复 `@PostConstruct`；`completed/stopped` 确认不再硬编码 `0`，在 `waitForWorkerExit` 写入真实 OS `exitCode`；终态延迟 `terminal-runtime-retention`（默认 `10m`）移除内存 `ManagedJobRuntime` 并全路径回退 H2；幂等查找前置到 `datasetService.getDetail` 之前；补充成员1 `T1-03` Python 路径合并冲突说明 |
 
 ## 现状核查（已复核，基于 main @ 32a7d80）
 
@@ -103,6 +103,46 @@
   - `max-history-events`: `240`（`DEEPVISION_TRAINING_MAX_HISTORY_EVENTS`）
   - `release-slot-on-pause`: `false`（`DEEPVISION_TRAINING_RELEASE_SLOT_ON_PAUSE`）
 
+## 合并前置条件：前端适配清单（交给成员4）
+
+> **合并约束**：本分支未修改 `frontend/`（归属成员4）。由于后端已改为「控制请求受理与 worker 执行确认分离」并新增了 `queued / failed / interrupted` 状态，若直接单独合入 `main`，前端在点击停止后会提前断开 WebSocket 导致界面卡在「运行中」。因此**本 PR 必须与成员4的下列前端适配一起合并，或者在成员4的前端适配之后合并**。
+
+1. **`frontend/src/app/shared/simulation/sim-models.ts`**
+   - **`TrainingState` 与 `TrainingRuntimeState`（约第 257～306 行）**：
+     - 将 `status` 联合类型从 `'idle' | 'running' | 'paused' | 'stopped' | 'completed'` 扩展为 `'idle' | 'queued' | 'running' | 'paused' | 'stopped' | 'completed' | 'failed' | 'interrupted'`；
+     - 新增可选状态详情字段：`pendingControl?: 'pause' | 'resume' | 'stop' | null`、`queuePosition?: number | null`、`errorCode?: string | null`、`errorReason?: string | null`、`device?: string | null`、`lastSequence?: number`。
+
+2. **`frontend/src/app/shared/training/training-runtime.service.ts`**
+   - **DTO 接口扩展（`BackendTrainingStartResponse`、`BackendControlResponse`、`BackendMetricMessage`，约第 200～239 行）**：
+     - 状态枚举全部补充 `'queued' | 'failed' | 'interrupted'`；
+     - `BackendTrainingStartResponse` 增加 `configDigest?: string`、`idempotentReplay?: boolean`、`queuePosition?: number | null`；
+     - `BackendControlResponse` 增加 `pendingControl?: 'pause' | 'resume' | 'stop' | null`、`accepted?: boolean`；
+     - `BackendMetricMessage` 增加 `sequence?: number`、`timestamp?: string`、`schemaVersion?: string`、`queuePosition?: number | null`、`errorCode?: string | null`、`device?: string | null`；新增 `BackendEventsResponse` 接口映射 `GET /api/training/{jobId}/events`。
+   - **`stop()` 与 `reset()`（约第 537～570 行）——停止后保留 WebSocket 等待终态确认**：
+     - 在 `stop()` 中调用 `await this.controlBackend('stop', ...)` 后**移除立即执行的 `this.closeSocket()`**（除非响应返回的 `status` 已经是 `'stopped'`，如排队中的任务被直接取消）；保持 WebSocket 连接直到收到终态事件（`control` 事件 `status` 为 `'stopped' | 'completed' | 'interrupted'`，或 `error` 事件进入 `'failed'`）后再关闭 socket。
+     - 若 `reset()` 需要等待旧任务停止后再清空会话，建议在确认停止或清理本地状态前妥善处理旧连接，或在终态后按需调用 `POST /api/training/{jobId}/reset` 获取新 `jobId`。
+   - **`controlBackend()`（约第 727～740 行）——控制响应仅作为「处理中」提示**：
+     - `POST /api/training/{jobId}/pause|resume|stop` 返回的是当前尚未切换的 `status`（如 `'running'`）加上 `pendingControl: 'pause' | 'resume' | 'stop'` 与 `accepted: true`；
+     - 不要把该 HTTP 响应当作最终状态切换，而应将 `response.pendingControl` 写入 `state$`（展示「暂停中… / 恢复中… / 停止中…」并禁用重复按钮），待 WebSocket 收到 worker 确认的 `type === 'control'` 事件后再更新最终 `status` 并清空 `pendingControl: null`。
+   - **`handleBackendMetric()` 与 `startBackendTraining()`（约第 379～400、633～725 行）——支持新状态与错误详情、禁止提前置 `completed`**：
+     - `startBackendTraining()`：当返回 `response.status === 'queued'` 时，写入 `status: 'queued'` 与 `queuePosition: response.queuePosition ?? null`，并正常建立 WebSocket 等待队首自动晋升为 `'running'`；
+     - `handleBackendMetric()` 处理 `message.type === 'error'`（第 641～647 行）：将状态置为 `status: 'failed'`（而非原先的 `'stopped'`），保存 `errorCode: message.errorCode ?? null`、`errorReason: message.message ?? null`、`pendingControl: null`，随后关闭 socket；
+     - `handleBackendMetric()` 处理 `message.type === 'control'`（第 648～655 行）：同步更新 `status`、`queuePosition`、`device`、`errorCode`（当 `status === 'interrupted'` 时展示重启中断原因），清空已确认的 `pendingControl`，且在 `message.status` 属于 `'completed' | 'stopped' | 'failed' | 'interrupted'` 时关闭 socket；
+     - `handleBackendMetric()` 处理 `message.type === 'metric'`（第 698～700 行）：**移除 `status: message.epoch >= message.totalEpochs ? 'completed' : 'running'` 的提前完成判定**（保持 `'running'`，避免在 `test_result` 和 `checkpoint.pt` 生成前过早显示已完成，统一以 `control(completed)` 事件为准）。
+   - **断线重连补齐与按 `sequence` 去重（`connectWebSocket()` / `handleBackendMetric()`，约第 608～640 行）**：
+     - 为当前 `backendJobId` 维护 `lastSeenSequence = 0`；每次处理 WebSocket 或补拉事件时，若 `typeof event.sequence === 'number'`，当 `event.sequence <= this.lastSeenSequence` 时直接丢弃去重，否则更新 `this.lastSeenSequence = event.sequence`；
+     - 当 WebSocket 非预期断开（`onclose` 时本地任务仍处于 `'queued' | 'running' | 'paused'` 非终态），调用 `GET /api/training/${jobId}/events?afterSequence=${this.lastSeenSequence}&limit=240` 按序回放漏掉的事件（若返回 `truncated === true`，额外调用 `GET /api/training/${jobId}/status` 同步最新快照），若返回 `status` 仍非终态则重连 WebSocket。
+   - **可选：`startBackendTraining()` 携带幂等键（约第 379～383 行）**：
+     - 每次用户点击启动训练生成一次 `const idempotencyKey = crypto.randomUUID()`，通过请求头 `headers: { 'Idempotency-Key': idempotencyKey }` 发送 `POST /api/training/start`；网络超时自动重试同一启动动作时复用该 `idempotencyKey`，避免重复创建训练进程。
+
+3. **`frontend/src/app/modes/mode-b/mode-b-page.component.ts`、`mode-b-page.component.html`（及 `training-collaboration-page.component.ts`）**
+   - 状态徽标与提示条支持渲染：
+     - `queued`：显示「排队中（队列位置 #`queuePosition`）」，允许点击「停止」直接取消排队任务；
+     - `pendingControl` 非空：显示过渡提示（`pause` →「正在等待当前 batch 暂停…」、`resume` →「正在恢复训练…」、`stop` →「正在安全停止训练…」）；
+     - `failed`：醒目展示失败状态、`errorCode`（如 `WORKER_CUDA_OOM`、`JOB_TIMEOUT`、`WORKER_NON_ZERO_EXIT`）与后端返回的友好修复建议 `errorReason`；
+     - `interrupted`：提示「后端服务重启导致训练中断（不支持断点续训），请重新启动训练」。
+   - HTTP 409 / 429 错误提示：利用后端 `TrainingErrorResponse` 返回的 `message`（及 `code`）向用户友好提示并发/队列已满（429）或状态冲突（409）。
+
 ## 改动文件清单
 
 - `docs/handoff/member3-training-jobs.md`（更新）
@@ -147,8 +187,13 @@
 
 ## 运行与测试方法
 
-- Java（标准环境）：`cd backend/spring && mvn -q test`（期望输出：退出码 `0`，19 项测试全部通过，0 失败 0 错误）
-- Python：`cd backend/python-training && .\.venv\Scripts\python.exe -m pytest tests -q`（期望输出：`7 passed`）
+- Java（标准环境）：`cd backend/spring && mvn -q clean test`（期望输出：退出码 `0`，10 个测试类共 **28 项测试全部通过**，0 失败 0 错误）
+- Java（本机离线环境命令）：
+  ```powershell
+  $env:JAVA_HOME = 'D:\Android\jbr'
+  mvn -o -f c:\Users\BCA\Desktop\code\CNN-explainer\backend\spring\pom.xml "-Dmaven.repo.local=c:\Users\BCA\Desktop\code\CNN-explainer\backend\spring\.m2\repository" "-DforkCount=0" -q clean test
+  ```
+- Python：`c:\Users\BCA\Desktop\code\CNN-explainer\backend\python-training\.venv\Scripts\python.exe -m pytest c:\Users\BCA\Desktop\code\CNN-explainer\backend\python-training\tests -q`（期望输出：`7 passed`）
 - 实际执行结果记录在下方「验收记录」与「会话日志」中。
 
 ## 验收记录
@@ -171,20 +216,44 @@
 - `backend/spring/src/main/resources/application.yml` 中 `deepvision.training.python-executable` 的环境变量化修改与成员1的 `T1-03` 重叠，合并 PR 时需注意解决该行冲突。
 - 当前开发机全局 PATH 中未预装 `mvn` 与 `gh`，测试通过本地 JDK (`D:\Android\jbr`) + 临时目录 Apache Maven 3.9.9 与 Python 3.12 (`D:\Python`) 虚拟环境执行。
 
+## PR 描述补充（可直接复制追加到现有 PR 描述）
+
+```markdown
+### ⚠️ 合并前置条件（必读）
+- **本 PR 必须与成员4的前端适配一起合并，或者在成员4的前端适配之后合并。**
+- 原因：本分支按分工边界未修改 `frontend/`。后端已将 `pause / resume / stop` 改为「HTTP 仅返回已受理（`pendingControl`），经 worker WebSocket `control` 事件确认后切换最终状态」，并新增了 `queued / failed / interrupted` 状态；而现有前端 `training-runtime.service.ts` 的 `stop()` 在收到 HTTP 响应后会立即调用 `closeSocket()`，在未合入前端适配前会导致界面收不到后续 `stopped` 确认而停留在运行中。详细逐文件函数级改造说明见 [`docs/handoff/member3-training-jobs.md`](docs/handoff/member3-training-jobs.md) 中的「合并前置条件：前端适配清单（交给成员4）」。
+
+### 代码评审修复摘要（B1–B3、S1–S4 及次要项）
+- **B1（`1307287`）**：移除把 `process == null` 误判为当前进程的逻辑，引入在 `schedulerLock` 内随槽位分配单调递增的进程代数 `runGeneration` 校验所有异步 worker 回调；`POST /api/training/{jobId}/reset` 采用方案A——仅允许终态任务调用（非终态返 HTTP 409 `INVALID_STATE_TRANSITION`），复用原请求走 `start()` 容量与单用户上限检查创建新 `jobId`，原任务及 `checkpoint.pt` 保持不变。
+- **B2（`2c04439`）**：`launchWorkerForSlotOwner()` 统一捕获 `IOException | RuntimeException`，确保任意启动异常均将任务置为 `failed`（`WORKER_START_FAILED`）、发出合成 `error` 事件、释放执行槽位并自动晋升排队任务。
+- **B3（本次提交）**：在交接文档补充成员4前端适配清单（文件、函数、预期行为）及本合并前置条件声明。
+- **S1（`32254a7`）**：完整接入 `deepvision.training.release-slot-on-pause`（`TrainingJobStateMachine.occupiesExecutionSlot`），为 `true` 时暂停确认后释放槽位晋升排队任务，`resume` 时重新申请槽位（无槽位返 HTTP 429 `TRAINING_CAPACITY_EXCEEDED` / `resume_slot_unavailable`）。
+- **S2（`a396323`）**：`jobTimeout` 改为基于单调时钟仅累计 `running` 状态活跃运行时间（`paused` 期间暂停计时，恢复后按剩余额度续计），并在交接文档补充 30m 默认值对纯 CPU 教学训练的评估。
+- **S3（`ff3fafd`）**：将 `TrainingJobEvent` 插入与历史窗口裁剪移出全局 `schedulerLock`（改为单任务 `persistenceLock`），高频流式事件每 16 条才 flush 一次 `TrainingJob`，历史裁剪改为按溢出阈值 16 条（及终态/按需查询时）批量执行，保持 `sequence` 严格单调。
+- **S4（`b4b8790`）**：将 `TrainingJobService.java` 与 `application.yml` 恢复为与 `origin/main` 一致的 `i/crlf` 换行符，消除约 1490 行纯换行符 diff。
+- **次要项（`3e0336e`）**：移除 `recoverOrphanedJobsOnStartup()` 重复的 `@PostConstruct`；`completed/stopped` 控制事件不再硬编码 `exitCode=0`，改为进程退出时写入真实 OS `exitCode`；新增 `terminal-runtime-retention`（默认 `10m`）延迟清理终态内存对象并全路径回退 H2；幂等查找前置到 `datasetService.getDetail` 之前；补充与成员1 `T1-03` 在 `application.yml` 中 `python-executable` 的合并冲突提示。
+
+### 最新回归测试结果
+- **Java（Spring Boot / JUnit 5 / DataJpaTest + MockMvc + 真实 OS 子进程 E2E）**：`mvn -q clean test` —— **10 个测试类共 28 项测试全部通过**（0 失败，0 错误）。
+- **Python（PyTorch training worker 控制与 CPU 闭环）**：`pytest tests -q` —— **7 项测试全部通过**。
+
+### 合并冲突提醒
+- `backend/spring/src/main/resources/application.yml` 中 `deepvision.training.python-executable` 环境变量化与成员1的 `T1-03` 位置重叠，合并时保留统一的环境变量配置即可。
+```
+
 ## 下一步（按优先级，下一个 agent 从这里开始）
 
-1. 在交互式终端手动完成分支推送与创建 PR（因仓库为公开仓库，`git fetch` 无需认证，而后台非交互终端执行 `git push` 时 Git Credential Manager 等待交互式 GitHub 凭据导致挂起，且本机未安装 `gh` CLI；按规范不绕过权限）：
+1. 按用户指示，由用户在终端执行普通推送更新远程分支及 PR（不要加 `--force`）：
    ```powershell
    cd c:\Users\BCA\Desktop\code\CNN-explainer
-   git push -u origin feature/member3-training-job-control
-   # 若已安装并登录 gh CLI：
-   gh pr create --base main --head feature/member3-training-job-control --title "feat(training): implement P0 training job lifecycle, resource limits, and recovery (T3-01..T3-09)"
+   git push origin feature/member3-training-job-control
    ```
-   推送成功后也可直接打开：`https://github.com/CiaCrystal/CNN-explainer/compare/main...feature/member3-training-job-control?expand=1` 粘贴 PR 描述提交。
-2. 代码评审与联调对齐：
-   - 与成员2对齐 `TrainingErrorResponse`（`code/message/details/requestId`）全局收敛及 `NetworkValidator` Bean 接入；
-   - 与成员4对齐 `queued / failed / interrupted` 状态、`pendingControl` 过渡指示、`Idempotency-Key` 请求头与 `/events?afterSequence=N` 增量拉取；
-   - 与成员5对齐 `backend/spring/pom.xml` 测试依赖与 CI 流水线执行 `mvn -q test` + `pytest`。
+   推送后将上方「PR 描述补充」章节内容追加到 GitHub PR 描述中。
+2. 跨成员联调与合并顺序把控：
+   - **成员4（合并前置）**：按本文档「合并前置条件：前端适配清单（交给成员4）」完成 `training-runtime.service.ts`、`sim-models.ts` 与 Mode B 页面适配后一起合并（或先合入前端兼容改动）；
+   - **成员1**：合并 `application.yml` 时对齐 `deepvision.training.python-executable`（`T1-03`）；
+   - **成员2**：对齐 `TrainingErrorResponse`（`code/message/details/requestId`）全局收敛及 `NetworkValidator` Bean 接入；
+   - **成员5**：对齐 `backend/spring/pom.xml` 测试依赖与 CI 流水线执行 `mvn -q clean test` + `pytest`。
 
 ## 会话日志
 
@@ -205,4 +274,5 @@
 - 2026-11-14 16:38（member3-followup-agent）：完成 S1（接入 `deepvision.training.release-slot-on-pause`，支持暂停确认释放槽位晋升排队任务、恢复时重申槽位及无槽位 429 错误，在 `TrainingControlConfirmationTest` 补充单测），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（24 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过），提交 `32254a7`。
 - 2026-11-14 16:40（member3-followup-agent）：完成 S2（将 `jobTimeout` 改为基于单调时钟仅累计 `running` 活跃耗时、`paused` 停止计时并在文档中评估 30m CPU 默认值合理性，在 `TrainingFailureAndRecoveryTest` 补充暂停跨超时单测），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（25 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过），提交 `a396323`。
 - 2026-11-14 16:50（member3-followup-agent）：完成 S3（将 `TrainingJobEvent` 写入与裁剪移出全局 `schedulerLock`、流式事件每 16 条批量 flush `TrainingJob`、历史事件按阈值 16 批量裁剪并在读取/终态兜底对齐窗口，在 `TrainingEventStreamAndHistoryTest` 补充批量裁剪单测），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（26 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过），提交 `ff3fafd`。
-- 2026-11-14 16:57（member3-followup-agent）：完成 5 项次要评审项（移除重复 `@PostConstruct`、在 `waitForWorkerExit` 写入真实 OS `exitCode`、新增 `terminal-runtime-retention` 延迟驱逐终态内存对象并回退 H2、将幂等查找前置到 `datasetService.getDetail` 之前、补充成员1 `T1-03` Python 路径冲突提示，并在 `TrainingControlConfirmationTest` 与 `TrainingIdempotencyTest` 新增单测），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（28 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过）。
+- 2026-11-14 16:57（member3-followup-agent）：完成 5 项次要评审项（移除重复 `@PostConstruct`、在 `waitForWorkerExit` 写入真实 OS `exitCode`、新增 `terminal-runtime-retention` 延迟驱逐终态内存对象并回退 H2、将幂等查找前置到 `datasetService.getDetail` 之前、补充成员1 `T1-03` Python 路径冲突提示，并在 `TrainingControlConfirmationTest` 与 `TrainingIdempotencyTest` 新增单测），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（28 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过），提交 `3e0336e`。
+- 2026-11-14 17:00（member3-followup-agent）：完成 B3（在交接文档中补充逐文件函数级的「合并前置条件：前端适配清单（交给成员4）」与可直接复制粘贴的「PR 描述补充」），再次复核全套 28 项 Java 测试与 7 项 Python 测试通过、`frontend/` 零改动、`i/crlf` 换行符一致；按用户指示不执行 `git push`，交由用户手动推送更新远程分支。
