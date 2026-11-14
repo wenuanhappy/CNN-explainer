@@ -128,8 +128,21 @@ public final class TrainingDtos {
       String status,
       int totalEpochs,
       int totalBatches,
-      String streamUrl
-  ) {}
+      String streamUrl,
+      String configDigest,
+      boolean idempotentReplay,
+      Integer queuePosition
+  ) {
+    public TrainingStartResponse(
+        String jobId,
+        String status,
+        int totalEpochs,
+        int totalBatches,
+        String streamUrl
+    ) {
+      this(jobId, status, totalEpochs, totalBatches, streamUrl, null, false, null);
+    }
+  }
 
   @Schema(description = "Training metric stream message")
   @JsonIgnoreProperties(ignoreUnknown = true)
@@ -167,11 +180,73 @@ public final class TrainingDtos {
       double latestAccuracy,
       Double latestValAccuracy,
       long elapsedSeconds,
-      long etaSeconds
-  ) {}
+      long etaSeconds,
+      String pendingControl,
+      String device,
+      long lastSequence,
+      Integer exitCode,
+      String errorCode,
+      String errorReason,
+      String configDigest,
+      Instant createdAt,
+      Instant startedAt,
+      Instant updatedAt,
+      Instant finishedAt
+  ) {
+    public TrainingStatusResponse(
+        String jobId,
+        String status,
+        int epoch,
+        int batch,
+        int totalEpochs,
+        int totalBatches,
+        double latestLoss,
+        Double latestValLoss,
+        double latestAccuracy,
+        Double latestValAccuracy,
+        long elapsedSeconds,
+        long etaSeconds
+    ) {
+      this(
+          jobId,
+          status,
+          epoch,
+          batch,
+          totalEpochs,
+          totalBatches,
+          latestLoss,
+          latestValLoss,
+          latestAccuracy,
+          latestValAccuracy,
+          elapsedSeconds,
+          etaSeconds,
+          null,
+          null,
+          0L,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null
+      );
+    }
+  }
 
   @Schema(description = "Training job control response")
-  public record TrainingControlResponse(String jobId, String status, String message) {}
+  public record TrainingControlResponse(
+      String jobId,
+      String status,
+      String message,
+      String pendingControl,
+      boolean accepted
+  ) {
+    public TrainingControlResponse(String jobId, String status, String message) {
+      this(jobId, status, message, null, true);
+    }
+  }
 
   @Schema(description = "Weight histogram bin")
   public record HistogramBin(String label, int count) {}

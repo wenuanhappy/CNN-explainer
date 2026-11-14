@@ -32,6 +32,13 @@ deepvision:
     jobs-root: ${java.io.tmpdir}/deepvision-test-training-jobs
     python-executable: python
     worker-script: ../python-training/training_worker.py
+    max-concurrent-jobs: 1
+    max-active-jobs-per-user: 10
+    max-queue-size: 4
+    job-timeout: 30s
+    stop-timeout: 1s
+    max-history-events: 240
+    release-slot-on-pause: false
   llm:
     ark-base-url: http://127.0.0.1:18081
     ark-api-key:

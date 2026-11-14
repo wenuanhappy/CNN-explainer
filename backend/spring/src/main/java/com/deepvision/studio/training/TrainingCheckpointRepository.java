@@ -10,4 +10,6 @@ public interface TrainingCheckpointRepository extends JpaRepository<TrainingChec
   List<TrainingCheckpoint> findByUserUsernameAndDatasetIdOrderByCreatedAtDesc(String username, String datasetId);
 
   Optional<TrainingCheckpoint> findByIdAndUserUsername(Long id, String username);
+
+  Optional<TrainingCheckpoint> findFirstByJobIdAndUserUsernameOrderByCreatedAtDesc(String jobId, String username);
 }

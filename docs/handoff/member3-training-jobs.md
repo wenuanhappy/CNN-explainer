@@ -5,8 +5,8 @@
 ## 基本信息
 
 - 分支：`feature/member3-training-job-control`（基于 `origin/main` @ `32a7d80`）
-- 最近更新：2026-11-14 14:55 by member3-agent
-- 当前状态：进行中（已完成 T3-01、T3-02，正在推进 T3-03 ~ T3-09）
+- 最近更新：2026-11-14 15:08 by member3-agent
+- 当前状态：进行中（已完成 T3-01 ~ T3-03，正在推进 T3-04 ~ T3-09）
 - PR：未创建
 - 任务依据：《DeepVision Studio 五人小组任务分工与验收安排》第 6 节（成员3），只做 P0，不做 P1
 
@@ -15,8 +15,8 @@
 | 编号 | 内容 | 状态 | 相关提交 | 备注 |
 | --- | --- | --- | --- | --- |
 | T3-01 | 持久化任务（实体 + Repository） | 完成 | `3e154ba` | `TrainingJob` + `TrainingJobRepository` + `application-test.yml` |
-| T3-02 | 状态机与转换规则、暂停资源策略 | 完成 | 本次提交 | 集中转换表 `TrainingJobStateMachine` + `pendingControl` + 409 错误契约 + `NetworkValidator` 预留 |
-| T3-03 | 并发 / 用户活动数 / 队列长度 / 超时配置 | 未开始 | | 本地默认并发 1 |
+| T3-02 | 状态机与转换规则、暂停资源策略 | 完成 | `4249500` | 集中转换表 `TrainingJobStateMachine` + `pendingControl` + 409 错误契约 + `NetworkValidator` 预留 |
+| T3-03 | 并发 / 用户活动数 / 队列长度 / 超时配置 | 完成 | 本次提交 | `TrainingProperties` + `TrainingProcessLauncher` + 并发槽位与有界 FIFO 队列，本地默认并发 1 |
 | T3-04 | 幂等启动 | 未开始 | | 拟使用请求头 `Idempotency-Key` |
 | T3-05 | 控制受理与 worker 执行确认分离 | 未开始 | | 终态 resume 返回 409 |
 | T3-06 | 启动失败、非零退出、停止超时、残留进程、槽位释放 | 未开始 | | |
@@ -47,16 +47,28 @@
 2. **2026-11-14（T3-02 状态机与过渡态方案预告）**：主状态固定为 `queued / running / paused / completed / stopped / failed / interrupted` 七种，采用独立的 `pendingControl` 字段（取值 `"pause" | "resume" | "stop" | null`）表达「控制请求已受理、等待 worker 确认」，而不是将 `status` 改为前端未知的 `pausing/stopping` 字符串，以最大化保持与现有 Angular `TrainingRuntimeService` 的向后兼容。
 3. **2026-11-14（T3-02 暂停资源策略预告）**：默认 `paused` 状态的任务**继续占用执行槽位**（可通过配置项 `deepvision.training.release-slot-on-pause=false` 控制），原因是暂停期间 Python/PyTorch 子进程仍驻留内存/显存持有模型参数与优化器状态，若释放槽位启动新训练极易导致显存溢出（OOM）。
 4. **2026-11-14（T3-04 幂等键传递方式预告）**：选择通过 HTTP 请求头 `Idempotency-Key` 传入幂等键，避免修改与成员2共用的 `StartTrainingRequest` 请求体结构减少合并冲突。
+5. **2026-11-14（T3-03 容量调度与可替换进程启动器）**：抽离 `TrainingProcessLauncher` + `ManagedWorkerProcess` 接口，默认使用 `DefaultTrainingProcessLauncher` 启动 OS 子进程，测试中注入 `ControllableTrainingProcessLauncher` 以脱离真实 GPU/Python 完成确定性并发验收；同时将 `application.yml` 中历史遗留的个人绝对路径 `C:/Users/lizihan/...` 清理为 `${DEEPVISION_TRAINING_PYTHON:python}`。
 
 ## 接口与协议变更（给成员2/4/5）
 
 - 新增/变更的 REST 接口：（T3-09 将新增 `GET /api/training/{jobId}/events`）
 - 请求头/请求体字段：支持请求头 `X-Request-Id` 透传或自动生成；（T3-04 将支持 `POST /api/training/start` 可选请求头 `Idempotency-Key`）
+- 响应字段新增（全部向后兼容保留旧字段）：
+  - `TrainingStartResponse` 新增：`configDigest`、`idempotentReplay`、`queuePosition`
+  - `TrainingStatusResponse` 新增：`pendingControl`、`device`、`lastSequence`、`exitCode`、`errorCode`、`errorReason`、`configDigest`、`createdAt`、`startedAt`、`updatedAt`、`finishedAt`
+  - `TrainingControlResponse` 新增：`pendingControl`、`accepted`
 - 状态枚举：`queued / running / paused / completed / stopped / failed / interrupted`，配合 `pendingControl`（`pause / resume / stop / null`）表示控制请求已受理待确认；暂停默认继续占用执行槽位。
 - 事件字段：（T3-09 将统一补齐 `jobId / sequence / timestamp / schemaVersion`）
-- 错误码与错误结构（`code/message/details/requestId`，**临时约定，待成员2确认**）：`TrainingErrorResponse` 同时保留旧版 `error` 同名镜像字段，新增 `INVALID_STATE_TRANSITION`（HTTP 409）等结构化异常。
+- 错误码与错误结构（`code/message/details/requestId`，**临时约定，待成员2确认**）：`TrainingErrorResponse` 同时保留旧版 `error` 同名镜像字段，已启用 `INVALID_STATE_TRANSITION`（HTTP 409）、`TRAINING_CAPACITY_EXCEEDED`（HTTP 429）、`USER_ACTIVE_JOB_LIMIT_EXCEEDED`（HTTP 429）、`WORKER_START_FAILED`（HTTP 500）。
 - 成员2网络校验接入点：`com.deepvision.studio.training.NetworkValidator` 接口（默认由 `TrainingValidationConfig` 提供 `@ConditionalOnMissingBean` 放行实现；成员2只需注册自己的 `NetworkValidator` Bean 即可在创建进程与占用槽位前自动拦截非法网络）。
-- 配置项及默认值：（T3-03 引入；测试环境配置见 `backend/spring/src/test/resources/application-test.yml`）
+- 配置项及默认值（`application.yml` 下 `deepvision.training.*`，均支持环境变量覆盖）：
+  - `max-concurrent-jobs`: `1`（`DEEPVISION_TRAINING_MAX_CONCURRENT_JOBS`）
+  - `max-active-jobs-per-user`: `2`（`DEEPVISION_TRAINING_MAX_ACTIVE_JOBS_PER_USER`）
+  - `max-queue-size`: `4`（`DEEPVISION_TRAINING_MAX_QUEUE_SIZE`）
+  - `job-timeout`: `30m`（`DEEPVISION_TRAINING_JOB_TIMEOUT`）
+  - `stop-timeout`: `10s`（`DEEPVISION_TRAINING_STOP_TIMEOUT`）
+  - `max-history-events`: `240`（`DEEPVISION_TRAINING_MAX_HISTORY_EVENTS`）
+  - `release-slot-on-pause`: `false`（`DEEPVISION_TRAINING_RELEASE_SLOT_ON_PAUSE`）
 
 ## 改动文件清单
 
@@ -75,7 +87,16 @@
 - `backend/spring/src/main/java/com/deepvision/studio/training/TrainingValidationConfig.java`（新增，`NetworkValidator` 默认放行配置）
 - `backend/spring/src/main/java/com/deepvision/studio/training/TrainingDtos.java`（新增 `TrainingErrorResponse` 及 JSON 未知字段容忍注解）
 - `backend/spring/src/main/java/com/deepvision/studio/training/TrainingController.java`（接入统一异常处理器）
-- `backend/spring/src/main/java/com/deepvision/studio/training/TrainingJobService.java`（重命名私有内部类消除命名冲突）
+- `backend/spring/src/main/resources/application.yml`（新增训练容量/队列/超时配置项，移除硬编码个人 Python 路径）
+- `backend/spring/src/main/java/com/deepvision/studio/training/TrainingProperties.java`（新增，容量与超时配置绑定）
+- `backend/spring/src/main/java/com/deepvision/studio/training/ManagedWorkerProcess.java`（新增，受管 worker 进程接口）
+- `backend/spring/src/main/java/com/deepvision/studio/training/TrainingProcessLauncher.java`（新增，可替换进程启动器接口）
+- `backend/spring/src/main/java/com/deepvision/studio/training/DefaultTrainingProcessLauncher.java`（新增，默认 OS 进程启动实现）
+- `backend/spring/src/main/java/com/deepvision/studio/training/TrainingCheckpointRepository.java`（新增按 `jobId` 防重复保存查询）
+- `backend/spring/src/main/java/com/deepvision/studio/training/TrainingJobService.java`（改造为基于 H2 持久化、并发槽位、有界等待队列与 `TrainingProcessLauncher` 的编排服务）
+- `backend/spring/src/test/java/com/deepvision/studio/training/ControllableTrainingProcessLauncher.java`（新增，可控模拟 worker 进程启动器）
+- `backend/spring/src/test/java/com/deepvision/studio/training/TrainingTestFixtures.java`（新增，测试数据集与请求构造辅助类）
+- `backend/spring/src/test/java/com/deepvision/studio/training/TrainingCapacityAndQueueTest.java`（新增，AC-03.2 并发/排队/容量限制单测）
 - `backend/spring/src/test/java/com/deepvision/studio/training/TrainingJobRepositoryTest.java`（新增，实体与幂等唯一约束单元测试）
 - `backend/spring/src/test/java/com/deepvision/studio/training/TrainingJobStateMachineTest.java`（新增，集中状态机与 409 校验单元测试）
 - `backend/python-training/tests/test_training_worker_control.py`（新增，worker 控制文件读取基础单测）
@@ -91,7 +112,7 @@
 | 验收编号 | 环境与输入 | 操作或命令 | 预期 | 实际 | 证据位置 | 结论 |
 | --- | --- | --- | --- | --- | --- | --- |
 | AC-03.1 | | 同一个幂等键提交两次 | 只有 1 个任务，最多 1 个进程 | | | 未执行 |
-| AC-03.2 | 测试配置：并发 2、队列 3 | 同时发出 6 个请求 | 最多 2 个执行、3 个排队，其余收到容量错误 | | | 未执行 |
+| AC-03.2 | 测试配置：并发 2、队列 3、单用户上限 10，内存 H2 + `ControllableTrainingProcessLauncher` | `mvn -q test` 执行 `TrainingCapacityAndQueueTest` 6 线程栅栏并发提交 | 最多 2 个执行、3 个排队，其余收到容量错误 | 2 个 `running`（启动 2 个受管进程）、3 个 `queued`、1 个抛出 HTTP 429 `TRAINING_CAPACITY_EXCEEDED`；首个任务完成后队首自动晋升为 `running` | `TrainingCapacityAndQueueTest.java` | 通过 |
 | AC-03.3 | | 暂停 / 继续 / 停止；对已完成任务调用 resume | 经确认后才变更状态；resume 返回 409 | | | 未执行 |
 | AC-03.4 | | 强制杀掉 worker；模拟服务重启 | 状态为 failed / interrupted，并有原因 | | | 未执行 |
 | AC-03.5 | | 任务结束或停止 | 释放槽位，没有遗留的未知受管进程 | | | 未执行 |
@@ -107,12 +128,13 @@
 
 ## 下一步（按优先级，下一个 agent 从这里开始）
 
-1. 实现 T3-03：`TrainingProperties` 容量与超时配置、`TrainingProcessLauncher` 抽象、全局并发槽位 + 用户活动任务数上限 + 有界等待队列，将 `TrainingJobService` 切换到持久化实体与队列调度，覆盖 AC-03.2。
-2. 实现 T3-04 ~ T3-07：幂等启动、控制受理与确认分离、启动失败/非零退出/停止超时/任务超时/残留进程清理、重启恢复 `interrupted`。
+1. 实现 T3-04：请求头 `Idempotency-Key` 幂等启动（同用户同键同配置幂等返回、不同配置返回 HTTP 409 `IDEMPOTENCY_KEY_CONFLICT`），覆盖 AC-03.1。
+2. 实现 T3-05 ~ T3-07：控制受理与 worker 确认分离、`stopTimeout` 超时强杀、异常退出与启动失败清理、重启恢复 `interrupted`，覆盖 AC-03.3 ~ AC-03.5。
 3. 实现 T3-08 ~ T3-09 及全链路集成测试。
 
 ## 会话日志
 
 - 2026-11-14 13:37：初始化。从 origin/main 建立分支，创建本交接文档，还没有改代码。
 - 2026-11-14 14:44（member3-agent）：完成现状核查与 T3-01（`TrainingJob` 实体、`TrainingJobRepository`、`spring-boot-starter-test`、`application-test.yml` 及 `TrainingJobRepositoryTest`，`mvn test` 与 `pytest` 均通过，提交 `3e154ba`）。
-- 2026-11-14 14:55（member3-agent）：完成 T3-02（`TrainingJobStatus`、`TrainingControlAction`、`TrainingJobStateMachine` 集中转换表与暂停占槽策略、统一错误契约 `TrainingErrorResponse`、`NetworkValidator` 扩展接口及单测）。
+- 2026-11-14 14:55（member3-agent）：完成 T3-02（`TrainingJobStatus`、`TrainingControlAction`、`TrainingJobStateMachine` 集中转换表与暂停占槽策略、统一错误契约 `TrainingErrorResponse`、`NetworkValidator` 扩展接口及单测，提交 `4249500`）。
+- 2026-11-14 15:08（member3-agent）：完成 T3-03（`TrainingProperties`、`TrainingProcessLauncher`、并发槽位与有界队列调度、`TrainingCapacityAndQueueTest` 验收 AC-03.2，`mvn test` 与 `pytest` 均通过）。

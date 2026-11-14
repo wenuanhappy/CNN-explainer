@@ -37,8 +37,15 @@ deepvision:
   training:
     stream-base-url: ${DEEPVISION_TRAINING_STREAM_BASE_URL:}
     jobs-root: ${DEEPVISION_TRAINING_JOBS_ROOT:./training-jobs}
-    python-executable: ${DEEPVISION_TRAINING_PYTHON:C:/Users/lizihan/miniconda3/envs/dl-platform/python.exe}
+    python-executable: ${DEEPVISION_TRAINING_PYTHON:python}
     worker-script: ${DEEPVISION_TRAINING_WORKER_SCRIPT:../python-training/training_worker.py}
+    max-concurrent-jobs: ${DEEPVISION_TRAINING_MAX_CONCURRENT_JOBS:1}
+    max-active-jobs-per-user: ${DEEPVISION_TRAINING_MAX_ACTIVE_JOBS_PER_USER:2}
+    max-queue-size: ${DEEPVISION_TRAINING_MAX_QUEUE_SIZE:4}
+    job-timeout: ${DEEPVISION_TRAINING_JOB_TIMEOUT:30m}
+    stop-timeout: ${DEEPVISION_TRAINING_STOP_TIMEOUT:10s}
+    max-history-events: ${DEEPVISION_TRAINING_MAX_HISTORY_EVENTS:240}
+    release-slot-on-pause: ${DEEPVISION_TRAINING_RELEASE_SLOT_ON_PAUSE:false}
   llm:
     ark-base-url: ${ARK_BASE_URL:https://ark.cn-beijing.volces.com/api/v3}
     ark-api-key: ${ARK_API_KEY:}
