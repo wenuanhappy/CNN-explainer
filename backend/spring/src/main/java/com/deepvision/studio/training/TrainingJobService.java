@@ -53,6 +53,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -301,7 +302,9 @@ public class TrainingJobService {
   public TrainingStatusResponse status(String jobId) {
     ManagedJobRuntime runtime = runtimes.get(jobId);
     if (runtime != null) {
-      return runtime.toStatusResponse();
+      synchronized (schedulerLock) {
+        return runtime.toStatusResponse();
+      }
     }
     TrainingJob entity = jobRepository.findById(jobId)
         .orElseThrow(() -> new IllegalArgumentException("Training job not found."));
@@ -315,7 +318,9 @@ public class TrainingJobService {
       if (!username.equals(runtime.owner())) {
         throw new IllegalArgumentException("Training job not found.");
       }
-      return runtime.toStatusResponse();
+      synchronized (schedulerLock) {
+        return runtime.toStatusResponse();
+      }
     }
     TrainingJob entity = jobRepository.findByJobIdAndOwner(jobId, username)
         .orElseThrow(() -> new IllegalArgumentException("Training job not found."));
@@ -628,8 +633,8 @@ public class TrainingJobService {
       ));
       runtime.setProcess(process);
       scheduleJobTimeout(runtime, process);
-      workerIoExecutor.submit(() -> readWorkerOutput(runtime, process));
-      workerIoExecutor.submit(() -> waitForWorkerExit(runtime, process));
+      Future<?> outputReaderFuture = workerIoExecutor.submit(() -> readWorkerOutput(runtime, process));
+      workerIoExecutor.submit(() -> waitForWorkerExit(runtime, process, outputReaderFuture));
     } catch (IOException ex) {
       List<ManagedJobRuntime> promoted = new ArrayList<>();
       synchronized (schedulerLock) {
@@ -738,7 +743,7 @@ public class TrainingJobService {
     try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.outputStream(), StandardCharsets.UTF_8))) {
       String line;
       while ((line = reader.readLine()) != null) {
-        if (shuttingDown || !runtime.isCurrentProcess(process)) {
+        if (shuttingDown || !runtime.isCurrentProcessOrTerminated(process)) {
           return;
         }
         handleWorkerLine(runtime, line.trim());
@@ -869,10 +874,21 @@ public class TrainingJobService {
     }, delayMs, TimeUnit.MILLISECONDS);
   }
 
-  private void waitForWorkerExit(ManagedJobRuntime runtime, ManagedWorkerProcess process) {
+  private void waitForWorkerExit(
+      ManagedJobRuntime runtime,
+      ManagedWorkerProcess process,
+      Future<?> outputReaderFuture
+  ) {
     try {
       int exitCode = process.waitFor();
       process.destroyForcibly();
+      if (outputReaderFuture != null) {
+        try {
+          outputReaderFuture.get(2, TimeUnit.SECONDS);
+        } catch (Exception ignored) {
+          // Best-effort wait to drain trailing stdout lines before final state reconciliation.
+        }
+      }
       if (shuttingDown) {
         return;
       }

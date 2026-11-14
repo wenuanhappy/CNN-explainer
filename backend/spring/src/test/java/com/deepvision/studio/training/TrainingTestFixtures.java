@@ -57,13 +57,13 @@ final class TrainingTestFixtures {
 
   static StartTrainingRequest sampleStartRequest(String datasetId, int batchSize, int totalEpochs) {
     ObjectNode inputLayer = MAPPER.createObjectNode();
-    inputLayer.put("id", "input-1");
+    inputLayer.put("id", 1);
     inputLayer.put("type", "input");
     inputLayer.put("enabled", true);
     inputLayer.putObject("params").put("inputKind", "table").put("featureCount", 2);
 
     ObjectNode outputLayer = MAPPER.createObjectNode();
-    outputLayer.put("id", "output-1");
+    outputLayer.put("id", 2);
     outputLayer.put("type", "output");
     outputLayer.put("enabled", true);
     outputLayer.putObject("params").put("units", 2).put("activation", "softmax");

@@ -5,8 +5,8 @@
 ## 基本信息
 
 - 分支：`feature/member3-training-job-control`（基于 `origin/main` @ `32a7d80`）
-- 最近更新：2026-11-14 15:19 by member3-agent
-- 当前状态：进行中（已完成 T3-01 ~ T3-07，正在推进 T3-08 ~ T3-09）
+- 最近更新：2026-11-14 15:26 by member3-agent
+- 当前状态：进行中（已完成 T3-01 ~ T3-08，正在推进 T3-09）
 - PR：未创建
 - 任务依据：《DeepVision Studio 五人小组任务分工与验收安排》第 6 节（成员3），只做 P0，不做 P1
 
@@ -19,9 +19,9 @@
 | T3-03 | 并发 / 用户活动数 / 队列长度 / 超时配置 | 完成 | `4760840` | `TrainingProperties` + `TrainingProcessLauncher` + 并发槽位与有界 FIFO 队列，本地默认并发 1 |
 | T3-04 | 幂等启动 | 完成 | `082b725` | 请求头 `Idempotency-Key` + `configDigest` 一致性校验 + 409 `IDEMPOTENCY_KEY_CONFLICT` |
 | T3-05 | 控制受理与 worker 执行确认分离 | 完成 | `0a4d9bf` | `pause/resume/stop` 返回已受理并置 `pendingControl`，经 worker `control` 事件确认后切最终态；`stopTimeout` 超时强杀；终态 `resume` 返 409 |
-| T3-06 | 启动失败、非零退出、停止超时、残留进程、槽位释放 | 完成 | 本次提交 | 覆盖启动异常、非零退出、`jobTimeout`、`stopTimeout`、子进程树清理与全路径槽位回收 |
-| T3-07 | 重启后未知活动任务标记 interrupted | 完成 | 本次提交 | 启动时扫描无受管存活进程的 `queued/running/paused` 任务置为 `interrupted`（不做续训） |
-| T3-08 | 实际设备上报、友好的 OOM 提示、CPU 路径 | 未开始 | | |
+| T3-06 | 启动失败、非零退出、停止超时、残留进程、槽位释放 | 完成 | `24d0730` | 覆盖启动异常、非零退出、`jobTimeout`、`stopTimeout`、子进程树清理与全路径槽位回收 |
+| T3-07 | 重启后未知活动任务标记 interrupted | 完成 | `24d0730` | 启动时扫描无受管存活进程的 `queued/running/paused` 任务置为 `interrupted`（不做续训） |
+| T3-08 | 实际设备上报、友好的 OOM 提示、CPU 路径 | 完成 | 本次提交 | worker 上报 `device`（`cuda`/`cpu`）、补全 `paused/running/stopped` 确认、CUDA OOM 退出码 `2` 与友好建议、CPU 训练单测 |
 | T3-09 | 事件 `jobId/sequence/timestamp/schemaVersion`，以及状态和历史查询 | 未开始 | | |
 
 ## 现状核查（已复核，基于 main @ 32a7d80）
@@ -102,7 +102,9 @@
 - `backend/spring/src/test/java/com/deepvision/studio/training/TrainingFailureAndRecoveryTest.java`（新增，AC-03.4 & AC-03.5 强杀 worker、启动失败、任务超时与服务重启恢复单测）
 - `backend/spring/src/test/java/com/deepvision/studio/training/TrainingJobRepositoryTest.java`（新增，实体与幂等唯一约束单元测试）
 - `backend/spring/src/test/java/com/deepvision/studio/training/TrainingJobStateMachineTest.java`（新增，集中状态机与 409 校验单元测试）
-- `backend/python-training/tests/test_training_worker_control.py`（新增，worker 控制文件读取基础单测）
+- `backend/python-training/training_worker.py`（仅改执行与控制部分：启动与控制事件上报 `device`、暂停/恢复/batch 内停止确认修复、CUDA OOM 捕获与退出码 `2`、常规错误退出码 `1`，未触碰模型构建与协议解析）
+- `backend/python-training/tests/test_training_worker_control.py`（扩充为 7 项 pytest 单测：覆盖设备选择、暂停/恢复/停止确认、batch 级立即停止、CUDA OOM 提示与退出码、小规模 CPU 训练闭环）
+- `backend/spring/src/test/java/com/deepvision/studio/training/TrainingDeviceAndOomTest.java`（新增，设备落库与 CUDA OOM 状态/退出码传播单测）
 
 ## 运行与测试方法
 
@@ -131,8 +133,8 @@
 
 ## 下一步（按优先级，下一个 agent 从这里开始）
 
-1. 实现 T3-08：`training_worker.py` 实际设备上报、控制循环确认事件修复（`paused/running/stopped` 与 batch 级停止退出）、CUDA OOM 友好提示与退出码，以及 CPU 训练单测与 Java 侧联动测试。
-2. 实现 T3-09：对外事件 `jobId/sequence/timestamp/schemaVersion` 包装、`GET /api/training/{jobId}/events?afterSequence=N` 有界历史接口及全链路真实子进程集成测试。
+1. 实现 T3-09：对外事件统一注入 `jobId / sequence / timestamp / schemaVersion`，持久化有界事件历史并暴露 `GET /api/training/{jobId}/events?afterSequence=N`。
+2. 补全端到端真实 OS 子进程与 MockMvc 契约集成测试，运行全套 `mvn test` 与 `pytest`，推送分支并创建 PR。
 
 ## 会话日志
 
@@ -142,4 +144,5 @@
 - 2026-11-14 15:08（member3-agent）：完成 T3-03（`TrainingProperties`、`TrainingProcessLauncher`、并发槽位与有界队列调度、`TrainingCapacityAndQueueTest` 验收 AC-03.2，`mvn test` 与 `pytest` 均通过，提交 `4760840`）。
 - 2026-11-14 15:11（member3-agent）：完成 T3-04（`Idempotency-Key` 幂等启动、配置摘要冲突 409 拦截与 `TrainingIdempotencyTest` 验收 AC-03.1，`mvn test` 与 `pytest` 均通过，提交 `082b725`）。
 - 2026-11-14 15:15（member3-agent）：完成 T3-05（控制请求受理与 worker 执行确认分离、`stopTimeout` 强杀兜底、终态 `resume` 409 校验与 `TrainingControlConfirmationTest` 验收 AC-03.3，`mvn test` 与 `pytest` 均通过，提交 `0a4d9bf`）。
-- 2026-11-14 15:19（member3-agent）：完成 T3-06 & T3-07（全路径异常清理、槽位回收、重启恢复 `interrupted` 与 `TrainingFailureAndRecoveryTest` 验收 AC-03.4/AC-03.5，`mvn test` 与 `pytest` 均通过）。
+- 2026-11-14 15:19（member3-agent）：完成 T3-06 & T3-07（全路径异常清理、槽位回收、重启恢复 `interrupted` 与 `TrainingFailureAndRecoveryTest` 验收 AC-03.4/AC-03.5，`mvn test` 与 `pytest` 均通过，提交 `24d0730`）。
+- 2026-11-14 15:26（member3-agent）：完成 T3-08（`training_worker.py` 设备上报、控制确认事件、CUDA OOM 友好提示与退出码，消除 Java stdout 与 `waitFor` 尾行竞态，`mvn test` 15 项与 `pytest` 7 项全部通过）。

@@ -18,6 +18,33 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif"}
+EXIT_OK = 0
+EXIT_RUNTIME_ERROR = 1
+EXIT_CUDA_OOM = 2
+
+
+def select_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def is_cuda_oom(exc: BaseException) -> bool:
+    oom_cls = getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None)
+    if isinstance(oom_cls, type) and isinstance(exc, oom_cls):
+        return True
+    message = str(exc).lower()
+    return (
+        "cuda out of memory" in message
+        or "cuda error: out of memory" in message
+        or "cublas_status_alloc_failed" in message
+    )
+
+
+def format_cuda_oom_message(exc: BaseException) -> str:
+    summary = str(exc).splitlines()[0].strip() if str(exc) else "CUDA out of memory"
+    return (
+        "GPU 显存不足（CUDA Out of Memory）：建议减小 batchSize（批大小）、缩小输入图像尺寸或减少网络通道数后重试。"
+        f" 原始错误: {summary}"
+    )
 
 
 class ModelBundle(nn.Sequential):
@@ -222,10 +249,10 @@ class ResidualBlock(nn.Module):
         return self.act(out)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--request", required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     request_path = Path(args.request).resolve()
     request = json.loads(request_path.read_text(encoding="utf-8"))
@@ -237,7 +264,7 @@ def main() -> int:
         infer_checkpoint_sample(request)
     else:
         train(request)
-    return 0
+    return EXIT_OK
 
 
 def train(request: dict[str, Any]) -> None:
@@ -266,8 +293,15 @@ def train(request: dict[str, Any]) -> None:
     sample_x, _ = dataset[0]
     class_count = len(getattr(dataset, "classes", []))
     model = build_model(layers, sample_x, class_count)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = select_device()
     model.to(device)
+    emit({
+        "type": "control",
+        "jobId": job_id,
+        "status": "running",
+        "device": device.type,
+        "message": f"Training started on {device.type}.",
+    })
 
     criterion = build_criterion(config, dataset)
     optimizer = build_optimizer(model.parameters(), config)
@@ -275,15 +309,42 @@ def train(request: dict[str, Any]) -> None:
 
     total_epochs = max(1, int(config.get("totalEpochs") or 20))
     start = time.time()
+    control_state: dict[str, Any] = {"stopped": False}
     for epoch in range(1, total_epochs + 1):
-        command = wait_if_paused(control_file)
+        command = wait_if_paused(control_file, job_id=job_id, device_type=device.type)
         if command == "stopped":
-            emit({"type": "control", "jobId": job_id, "status": "stopped", "message": "Training stopped."})
+            emit({
+                "type": "control",
+                "jobId": job_id,
+                "status": "stopped",
+                "device": device.type,
+                "message": "Training stopped.",
+            })
             return
 
         loss, accuracy, gradient_norm, backprop = train_epoch(
-            model, train_loader, criterion, optimizer, device, control_file, job_id, epoch, total_epochs, total_batches, config
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            control_file,
+            job_id,
+            epoch,
+            total_epochs,
+            total_batches,
+            config,
+            control_state=control_state,
         )
+        if control_state.get("stopped"):
+            emit({
+                "type": "control",
+                "jobId": job_id,
+                "status": "stopped",
+                "device": device.type,
+                "message": "Training stopped.",
+            })
+            return
         if scheduler is not None:
             scheduler.step()
         val_loss = None
@@ -321,6 +382,7 @@ def train(request: dict[str, Any]) -> None:
             "weightMean": round(weight_mean, 4),
             "weightStd": round(weight_std, 4),
             "gradientStatus": gradient_status(gradient_norm),
+            "device": device.type,
         })
 
     save_checkpoint(checkpoint_file, model, layers, dataset_id, config, class_count, model_signature)
@@ -337,7 +399,13 @@ def train(request: dict[str, Any]) -> None:
         "checkpointPath": str(checkpoint_file),
         "samples": collect_prediction_samples(model, dataset, test_set, device, dataset_root, limit=8),
     })
-    emit({"type": "control", "jobId": job_id, "status": "completed", "message": "Training completed. Test set evaluated."})
+    emit({
+        "type": "control",
+        "jobId": job_id,
+        "status": "completed",
+        "device": device.type,
+        "message": "Training completed. Test set evaluated.",
+    })
 
 
 def test_checkpoint(request: dict[str, Any]) -> None:
@@ -777,6 +845,7 @@ def train_epoch(
     total_epochs: int,
     total_batches: int,
     config: dict[str, Any],
+    control_state: dict[str, Any] | None = None,
 ) -> tuple[float, float, float, dict[str, Any] | None]:
     model.train()
     mode = criterion_mode(criterion)
@@ -787,8 +856,10 @@ def train_epoch(
     last_gradient_norm = 0.0
     latest_backprop: dict[str, Any] | None = None
     for batch_index, (x, y) in enumerate(loader, start=1):
-        command = wait_if_paused(control_file)
+        command = wait_if_paused(control_file, job_id=job_id, device_type=device.type)
         if command == "stopped":
+            if control_state is not None:
+                control_state["stopped"] = True
             break
         x = x.to(device)
         y = y.to(device)
@@ -1323,12 +1394,40 @@ def gradient_status(norm: float) -> str:
     return "stable"
 
 
-def wait_if_paused(control_file: Path) -> str:
+def wait_if_paused(
+    control_file: Path,
+    job_id: str | None = None,
+    device_type: str | None = None,
+    poll_interval: float = 0.2,
+) -> str:
+    entered_pause = False
     while True:
         command = read_control(control_file)
         if command != "paused":
+            if entered_pause and command == "running" and job_id is not None:
+                payload: dict[str, Any] = {
+                    "type": "control",
+                    "jobId": job_id,
+                    "status": "running",
+                    "message": "Training resumed.",
+                }
+                if device_type:
+                    payload["device"] = device_type
+                emit(payload)
             return command
-        time.sleep(0.25)
+        if not entered_pause:
+            entered_pause = True
+            if job_id is not None:
+                payload = {
+                    "type": "control",
+                    "jobId": job_id,
+                    "status": "paused",
+                    "message": "Training paused.",
+                }
+                if device_type:
+                    payload["device"] = device_type
+                emit(payload)
+        time.sleep(poll_interval)
 
 
 def read_control(control_file: Path) -> str:
@@ -1390,9 +1489,51 @@ def emit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
-if __name__ == "__main__":
+def _extract_job_id_from_argv(argv: list[str] | None) -> str | None:
     try:
-        raise SystemExit(main())
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--request")
+        known, _ = parser.parse_known_args(argv)
+        if not known.request:
+            return None
+        payload = json.loads(Path(known.request).read_text(encoding="utf-8"))
+        raw = payload.get("jobId")
+        return str(raw) if raw else None
+    except Exception:
+        return None
+
+
+def run_cli(argv: list[str] | None = None) -> int:
+    job_id = _extract_job_id_from_argv(argv)
+    try:
+        return main(argv)
     except Exception as exc:
-        emit({"type": "error", "message": str(exc)})
-        raise
+        if is_cuda_oom(exc):
+            try:
+                if hasattr(torch, "cuda") and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            payload: dict[str, Any] = {
+                "type": "error",
+                "errorCode": "CUDA_OOM",
+                "message": format_cuda_oom_message(exc),
+            }
+            if job_id:
+                payload["jobId"] = job_id
+            emit(payload)
+            return EXIT_CUDA_OOM
+
+        payload = {
+            "type": "error",
+            "errorCode": "WORKER_RUNTIME_ERROR",
+            "message": str(exc),
+        }
+        if job_id:
+            payload["jobId"] = job_id
+        emit(payload)
+        return EXIT_RUNTIME_ERROR
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_cli())
