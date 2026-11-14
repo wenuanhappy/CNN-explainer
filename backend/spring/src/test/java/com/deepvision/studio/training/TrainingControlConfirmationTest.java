@@ -191,4 +191,87 @@ class TrainingControlConfirmationTest {
     assertThat(activeService.activeSlotCount()).isEqualTo(0);
     assertThat(activeService.activeManagedProcessCount()).isEqualTo(0);
   }
+
+  @Test
+  void releaseSlotOnPauseFreesSlotForQueuedJobAndRequiresSlotReacquisitionOnResume() throws Exception {
+    TrainingProperties props = new TrainingProperties();
+    props.setJobsRoot(tempDir.resolve("jobs-release-on-pause").toString());
+    props.setMaxConcurrentJobs(1);
+    props.setMaxQueueSize(3);
+    props.setMaxActiveJobsPerUser(5);
+    props.setReleaseSlotOnPause(true);
+
+    ControllableTrainingProcessLauncher launcher = new ControllableTrainingProcessLauncher();
+    activeService = new TrainingJobService(
+        TrainingTestFixtures.mockDatasetService(),
+        userRepository,
+        checkpointRepository,
+        jobRepository,
+        (req, ds) -> {},
+        launcher,
+        props,
+        new ObjectMapper(),
+        tempDir.resolve("datasets").toString()
+    );
+
+    TrainingStartResponse aliceJob = activeService.start(TrainingTestFixtures.sampleStartRequest(32, 6), "alice");
+    TrainingStartResponse bobJob = activeService.start(TrainingTestFixtures.sampleStartRequest(32, 4), "bob");
+    assertThat(aliceJob.status()).isEqualTo("running");
+    assertThat(bobJob.status()).isEqualTo("queued");
+
+    FakeWorkerProcess aliceWorker = launcher.awaitProcess(aliceJob.jobId(), Duration.ofSeconds(2));
+    activeService.pause("alice", aliceJob.jobId());
+    aliceWorker.emitControl("paused", "Paused on batch boundary.");
+
+    // Once aliceWorker confirms paused, its slot is released and bobJob automatically promotes from queued to running!
+    TrainingTestFixtures.awaitUntil(
+        Duration.ofSeconds(2),
+        () -> "paused".equals(activeService.status("alice", aliceJob.jobId()).status())
+            && "running".equals(activeService.status("bob", bobJob.jobId()).status()),
+        "Expected paused confirmation to release slot and promote bob's queued job"
+    );
+    assertThat(activeService.activeSlotCount()).isEqualTo(1);
+    FakeWorkerProcess bobWorker = launcher.awaitProcess(bobJob.jobId(), Duration.ofSeconds(2));
+
+    // Attempting to resume aliceJob while bobJob occupies the single slot returns HTTP 429 TRAINING_CAPACITY_EXCEEDED
+    assertThatThrownBy(() -> activeService.resume("alice", aliceJob.jobId()))
+        .isInstanceOf(TrainingCapacityException.class)
+        .satisfies(ex -> {
+          TrainingCapacityException capEx = (TrainingCapacityException) ex;
+          assertThat(capEx.httpStatus()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+          assertThat(capEx.code()).isEqualTo("TRAINING_CAPACITY_EXCEEDED");
+          assertThat(capEx.details()).containsEntry("reason", "resume_slot_unavailable");
+        });
+    assertThat(activeService.status("alice", aliceJob.jobId()).status()).isEqualTo("paused");
+    assertThat(activeService.status("alice", aliceJob.jobId()).pendingControl()).isNull();
+
+    // After bobJob completes and frees the slot, resuming aliceJob re-acquires the slot and finishes cleanly
+    bobWorker.completeCleanly();
+    TrainingTestFixtures.awaitUntil(
+        Duration.ofSeconds(2),
+        () -> "completed".equals(activeService.status("bob", bobJob.jobId()).status())
+            && activeService.activeSlotCount() == 0,
+        "Expected bobJob to complete and free slot"
+    );
+
+    TrainingControlResponse resumeAccepted = activeService.resume("alice", aliceJob.jobId());
+    assertThat(resumeAccepted.accepted()).isTrue();
+    assertThat(resumeAccepted.pendingControl()).isEqualTo("resume");
+    assertThat(activeService.activeSlotCount()).isEqualTo(1);
+
+    aliceWorker.emitControl("running", "Resumed.");
+    TrainingTestFixtures.awaitUntil(
+        Duration.ofSeconds(2),
+        () -> "running".equals(activeService.status("alice", aliceJob.jobId()).status()),
+        "Expected aliceJob to transition back to running"
+    );
+    aliceWorker.completeCleanly();
+    TrainingTestFixtures.awaitUntil(
+        Duration.ofSeconds(2),
+        () -> "completed".equals(activeService.status("alice", aliceJob.jobId()).status())
+            && activeService.activeSlotCount() == 0
+            && activeService.activeManagedProcessCount() == 0,
+        "Expected aliceJob to complete and release slot"
+    );
+  }
 }

@@ -528,7 +528,23 @@ public class TrainingJobService {
       TrainingJobStateMachine.validateControlRequest(
           runtime.jobId(), runtime.statusEnum(), runtime.pendingControlEnum(), TrainingControlAction.RESUME
       );
+      boolean needsSlot = !activeSlotJobIds.contains(runtime.jobId());
+      if (needsSlot && activeSlotJobIds.size() >= properties.getMaxConcurrentJobs()) {
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("jobId", runtime.jobId());
+        details.put("reason", "resume_slot_unavailable");
+        details.put("maxConcurrentJobs", properties.getMaxConcurrentJobs());
+        details.put("activeSlots", activeSlotJobIds.size());
+        throw new TrainingCapacityException(
+            "TRAINING_CAPACITY_EXCEEDED",
+            "No execution slot available to resume paused training job; retry after active jobs finish.",
+            details
+        );
+      }
       writeControl(runtime, "running");
+      if (needsSlot) {
+        activeSlotJobIds.add(runtime.jobId());
+      }
       runtime.entity().setPendingControl(TrainingControlAction.RESUME.wireValue());
       runtime.entity().setUpdatedAt(Instant.now());
       jobRepository.saveAndFlush(runtime.entity());
@@ -1055,10 +1071,15 @@ public class TrainingJobService {
                   ? TrainingControlAction.STOP.wireValue()
                   : null;
               transitionJobWithPendingLocked(runtime, TrainingJobStatus.PAUSED, nextPending, null, null, null);
+              if (!TrainingJobStateMachine.occupiesExecutionSlot(
+                  TrainingJobStatus.PAUSED, properties.isReleaseSlotOnPause())) {
+                releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
+              }
             }
           }
           case "running" -> {
             if (current == TrainingJobStatus.PAUSED
+                && activeSlotJobIds.contains(runtime.jobId())
                 && TrainingJobStateMachine.canTransition(current, TrainingJobStatus.RUNNING)) {
               String nextPending = runtime.pendingControlEnum() == TrainingControlAction.STOP
                   ? TrainingControlAction.STOP.wireValue()

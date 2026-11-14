@@ -29,9 +29,9 @@
 | 编号 | 内容 | 状态 | 相关提交 | 备注 |
 | --- | --- | --- | --- | --- |
 | B1 | `reset()` 竞态（`runGeneration` 进程代数）与终态新建任务语义（方案A） | 完成 | `1307287` | 移除 `isCurrentProcessOrTerminated` 的 `null` 误判，改用单调 `runGeneration` 校验回调；`reset` 仅允许终态任务并复用原请求走 `start` 创建新 `jobId`（非终态返 409、保留原 `checkpoint.pt`） |
-| B2 | `launchWorkerForSlotOwner()` 捕获 `RuntimeException` 释放槽位并晋升队列 | 完成 | 本次提交 | 捕获 `IOException \| RuntimeException`，统一转 `failed`（`WORKER_START_FAILED`）、发出合成 `error` 事件、释放槽位并自动晋升排队任务 |
+| B2 | `launchWorkerForSlotOwner()` 捕获 `RuntimeException` 释放槽位并晋升队列 | 完成 | `2c04439` | 捕获 `IOException \| RuntimeException`，统一转 `failed`（`WORKER_START_FAILED`）、发出合成 `error` 事件、释放槽位并自动晋升排队任务 |
 | B3 | 交接文档与 PR 描述补充成员4前端适配清单（合并前置条件） | 未开始 | | |
-| S1 | 接入 `release-slot-on-pause` 配置（暂停释放槽位、恢复重申槽位/排队） | 未开始 | | |
+| S1 | 接入 `release-slot-on-pause` 配置（暂停释放槽位、恢复重申槽位/排队） | 完成 | 本次提交 | 接入 `TrainingJobStateMachine.occupiesExecutionSlot`：`true` 时确认暂停后释放槽位并晋升排队任务，`resume` 时重申槽位（无空闲槽位返 429 `TRAINING_CAPACITY_EXCEEDED` / `resume_slot_unavailable`） |
 | S2 | `jobTimeout` 仅累计实际运行时间（暂停停止计时、恢复续计） | 未开始 | | |
 | S3 | 事件持久化减少锁内 DB 写入与按间隔批量裁剪历史事件 | 未开始 | | |
 | S4 | 恢复 `TrainingJobService.java` 与 `application.yml` 的 `i/crlf` 换行符 | 完成 | `b4b8790` | 消除约 1490 行纯换行符虚增 diff |
@@ -65,6 +65,8 @@
 7. **2026-11-14（B1 进程代数 `runGeneration` 与 `reset` 方案A）**：
    - **进程归属代数（`runGeneration`）**：删除把 `process == null` 当作当前进程的 `isCurrentProcessOrTerminated`；在 `schedulerLock` 内分配槽位时同步递增 `ManagedJobRuntime.runGeneration`，并在启动完成挂载 `process` 时再次在 `schedulerLock` 内核对代数与非终态（若已被取消/强杀则立即销毁子进程）。所有异步回调（`readWorkerOutput`、`waitForWorkerExit`、`onStopTimeout`、`onJobTimeout`）均携带所属 `runGeneration`，代数不一致时直接忽略，彻底杜绝旧进程延迟退出把新运行标为 `failed` 或误释放槽位。
    - **`reset` 语义采用方案A**：经核实前端 `training-runtime.service.ts` 通过 `stop()` 实现重置、未调用 `/reset`，但为保持 REST 接口向后兼容并保护已生成的 `checkpoint.pt`，选择推荐的**方案A**——`POST /api/training/{jobId}/reset` 仅允许在终态（`completed / stopped / failed / interrupted`）调用（非终态返回 HTTP 409 `INVALID_STATE_TRANSITION`），并复用原任务的 `StartTrainingRequest` 委托 `start()` 创建全新 `jobId`（完整执行单用户活动上限、全局并发槽位与队列容量检查），原任务记录及其目录下的 `checkpoint.pt` 保持不变。
+
+8. **2026-11-14（S1 接入 `release-slot-on-pause` 槽位释放与重申策略）**：在 worker 确认 `paused` 时调用 `TrainingJobStateMachine.occupiesExecutionSlot(PAUSED, properties.isReleaseSlotOnPause())`。默认 `false` 时暂停任务继续占用执行槽位以防止 GPU 显存 OOM；当设为 `true`（适合纯 CPU 环境）时，确认暂停后立即释放执行槽位并自动晋升排队任务（此时休眠轮询 `control.json` 的 Python 子进程仍保留在内存中以便恢复，不占执行槽位）；调用 `resume` 时在 `schedulerLock` 内重新申请槽位，若当前无空闲槽位则保持 `paused` 状态并返回明确错误 HTTP 429 `TRAINING_CAPACITY_EXCEEDED`（`details.reason = "resume_slot_unavailable"`），待其他运行任务结束释放槽位后即可成功恢复。
 
 ## 接口与协议变更（给成员2/4/5）
 
@@ -187,4 +189,5 @@
 - 2026-11-14 16:00（member3-agent）：执行 `git push -u origin feature/member3-training-job-control` 时因后台非交互环境无法弹出 GitHub HTTPS 凭据认证而阻塞，且本机无 `gh` CLI；按第 6 节规范取消挂起命令、记录状态并提供手动推送与创建 PR 命令。
 - 2026-11-14 16:17（member3-followup-agent）：开始处理代码评审意见；首先完成 S4，将 `TrainingJobService.java` 与 `application.yml` 恢复为与 `origin/main` 一致的 `i/crlf`（两文件相对 `origin/main` 的 diff 从 `2037+/1090-` 降至 `1292+/345-`），并执行 `mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（19 项通过）与 `pytest tests -q`（7 项通过），提交 `b4b8790`。
 - 2026-11-14 16:33（member3-followup-agent）：完成 B1（引入 `runGeneration` 进程代数消除旧进程回调竞态，`reset()` 采用方案A仅允许终态任务创建新 `jobId` 并保护原 `checkpoint.pt`，新增 `TrainingResetAndGenerationTest` 3 项回归测试），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（22 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过），提交 `1307287`。
-- 2026-11-14 16:35（member3-followup-agent）：完成 B2（`launchWorkerForSlotOwner()` 捕获 `IOException | RuntimeException`，确保任意启动异常均标记 `failed`/`WORKER_START_FAILED`、发出合成 `error` 事件、释放槽位并晋升下一排队任务，在 `TrainingFailureAndRecoveryTest` 新增回归测试），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（23 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过）。
+- 2026-11-14 16:35（member3-followup-agent）：完成 B2（`launchWorkerForSlotOwner()` 捕获 `IOException | RuntimeException`，确保任意启动异常均标记 `failed`/`WORKER_START_FAILED`、发出合成 `error` 事件、释放槽位并晋升下一排队任务，在 `TrainingFailureAndRecoveryTest` 新增回归测试），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（23 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过），提交 `2c04439`。
+- 2026-11-14 16:38（member3-followup-agent）：完成 S1（接入 `deepvision.training.release-slot-on-pause`，支持暂停确认释放槽位晋升排队任务、恢复时重申槽位及无槽位 429 错误，在 `TrainingControlConfirmationTest` 补充单测），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（24 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过）。
