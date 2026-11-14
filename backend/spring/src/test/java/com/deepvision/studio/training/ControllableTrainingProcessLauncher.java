@@ -27,10 +27,18 @@ public class ControllableTrainingProcessLauncher implements TrainingProcessLaunc
   private final Map<String, FakeWorkerProcess> processesByJobId = new ConcurrentHashMap<>();
   private final List<FakeWorkerProcess> allProcesses = new CopyOnWriteArrayList<>();
   private volatile Function<WorkerLaunchRequest, IOException> failureInjector;
+  private volatile Function<WorkerLaunchRequest, RuntimeException> runtimeFailureInjector;
 
   @Override
   public ManagedWorkerProcess launch(WorkerLaunchRequest request) throws IOException {
     launchCount.incrementAndGet();
+    Function<WorkerLaunchRequest, RuntimeException> rtInjector = runtimeFailureInjector;
+    if (rtInjector != null) {
+      RuntimeException rtFailure = rtInjector.apply(request);
+      if (rtFailure != null) {
+        throw rtFailure;
+      }
+    }
     Function<WorkerLaunchRequest, IOException> injector = failureInjector;
     if (injector != null) {
       IOException failure = injector.apply(request);
@@ -46,6 +54,10 @@ public class ControllableTrainingProcessLauncher implements TrainingProcessLaunc
 
   public void setFailureInjector(Function<WorkerLaunchRequest, IOException> failureInjector) {
     this.failureInjector = failureInjector;
+  }
+
+  public void setRuntimeFailureInjector(Function<WorkerLaunchRequest, RuntimeException> runtimeFailureInjector) {
+    this.runtimeFailureInjector = runtimeFailureInjector;
   }
 
   public int totalLaunches() {

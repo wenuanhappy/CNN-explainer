@@ -831,8 +831,11 @@ public class TrainingJobService {
       }
       Future<?> outputReaderFuture = workerIoExecutor.submit(() -> readWorkerOutput(runtime, process, runGeneration));
       workerIoExecutor.submit(() -> waitForWorkerExit(runtime, process, runGeneration, outputReaderFuture));
-    } catch (IOException ex) {
-      String startErrorMessage = "Failed to start Python training worker: " + ex.getMessage();
+    } catch (IOException | RuntimeException ex) {
+      String detail = ex.getMessage() == null || ex.getMessage().isBlank()
+          ? ex.getClass().getSimpleName()
+          : ex.getMessage();
+      String startErrorMessage = "Failed to start Python training worker: " + detail;
       List<ScheduledLaunch> promoted = new ArrayList<>();
       boolean shouldEmitError = false;
       synchronized (schedulerLock) {
@@ -859,7 +862,7 @@ public class TrainingJobService {
         throw new TrainingApiException(
             HttpStatus.INTERNAL_SERVER_ERROR,
             "WORKER_START_FAILED",
-            "Failed to start Python training worker: " + ex.getMessage(),
+            startErrorMessage,
             Map.of("jobId", runtime.jobId())
         );
       }

@@ -161,6 +161,85 @@ class TrainingFailureAndRecoveryTest {
   }
 
   @Test
+  void runtimeExceptionDuringWorkerLaunchMarksJobFailedReleasesSlotAndPromotesQueuedJob() throws Exception {
+    TrainingProperties props = new TrainingProperties();
+    props.setJobsRoot(tempDir.resolve("jobs-runtime-ex").toString());
+    props.setMaxConcurrentJobs(1);
+    props.setMaxQueueSize(3);
+    props.setMaxActiveJobsPerUser(5);
+
+    ControllableTrainingProcessLauncher launcher = new ControllableTrainingProcessLauncher();
+    activeService = new TrainingJobService(
+        TrainingTestFixtures.mockDatasetService(),
+        userRepository,
+        checkpointRepository,
+        jobRepository,
+        (req, ds) -> {},
+        launcher,
+        props,
+        new ObjectMapper(),
+        tempDir.resolve("datasets").toString()
+    );
+
+    // 1. Direct start() throwing RuntimeException must mark job failed, emit synthetic error, and release slot
+    AtomicBoolean failDirectRuntime = new AtomicBoolean(true);
+    launcher.setRuntimeFailureInjector(
+        req -> failDirectRuntime.get() ? new IllegalStateException("Invalid ProcessBuilder environment") : null
+    );
+
+    assertThatThrownBy(() -> activeService.start(TrainingTestFixtures.sampleStartRequest(32, 4), "alice"))
+        .isInstanceOf(TrainingApiException.class)
+        .satisfies(ex -> assertThat(((TrainingApiException) ex).code()).isEqualTo("WORKER_START_FAILED"));
+
+    assertThat(activeService.activeSlotCount()).isEqualTo(0);
+    assertThat(activeService.activeManagedProcessCount()).isEqualTo(0);
+    TrainingJob directFailed = jobRepository.findAll().get(0);
+    assertThat(directFailed.getStatus()).isEqualTo("failed");
+    assertThat(directFailed.getErrorCode()).isEqualTo("WORKER_START_FAILED");
+    assertThat(directFailed.getErrorReason()).contains("Invalid ProcessBuilder environment");
+    var directEvents = activeService.events("alice", directFailed.getJobId(), 0L, 10);
+    assertThat(directEvents.events()).anyMatch(
+        ev -> "error".equals(ev.path("type").asText()) && "WORKER_START_FAILED".equals(ev.path("errorCode").asText())
+    );
+
+    // 2. Promoted queued job throwing RuntimeException must fail cleanly, release slot, and auto-promote next queued job
+    failDirectRuntime.set(false);
+    TrainingStartResponse first = activeService.start(TrainingTestFixtures.sampleStartRequest(32, 4), "alice");
+    TrainingStartResponse second = activeService.start(TrainingTestFixtures.sampleStartRequest(32, 4), "bob");
+    TrainingStartResponse third = activeService.start(TrainingTestFixtures.sampleStartRequest(32, 4), "carol");
+    assertThat(first.status()).isEqualTo("running");
+    assertThat(second.status()).isEqualTo("queued");
+    assertThat(third.status()).isEqualTo("queued");
+
+    launcher.setRuntimeFailureInjector(
+        req -> second.jobId().equals(req.jobId()) ? new IllegalArgumentException("Bad command argument") : null
+    );
+
+    // Completing first job promotes second (throws RuntimeException -> failed), which immediately promotes third!
+    launcher.awaitProcess(first.jobId(), Duration.ofSeconds(2)).completeCleanly();
+
+    TrainingTestFixtures.awaitUntil(
+        Duration.ofSeconds(2),
+        () -> "failed".equals(activeService.status("bob", second.jobId()).status())
+            && "running".equals(activeService.status("carol", third.jobId()).status()),
+        "Expected RuntimeException on promoted job2 to fail job2 and promote queued job3 to running"
+    );
+
+    TrainingStatusResponse secondStatus = activeService.status("bob", second.jobId());
+    assertThat(secondStatus.errorCode()).isEqualTo("WORKER_START_FAILED");
+    assertThat(secondStatus.errorReason()).contains("Bad command argument");
+    assertThat(activeService.activeSlotCount()).isEqualTo(1);
+
+    launcher.awaitProcess(third.jobId(), Duration.ofSeconds(2)).completeCleanly();
+    TrainingTestFixtures.awaitUntil(
+        Duration.ofSeconds(2),
+        () -> "completed".equals(activeService.status("carol", third.jobId()).status())
+            && activeService.activeSlotCount() == 0,
+        "Expected third job to complete and release slot"
+    );
+  }
+
+  @Test
   void serviceRestartMarksOrphanedRunningPausedAndQueuedJobsAsInterrupted() throws Exception {
     TrainingProperties props = new TrainingProperties();
     props.setJobsRoot(tempDir.resolve("jobs-restart").toString());
