@@ -24,6 +24,19 @@
 | T3-08 | 实际设备上报、友好的 OOM 提示、CPU 路径 | 完成 | `83339a2` | worker 上报 `device`（`cuda`/`cpu`）、补全 `paused/running/stopped` 确认、CUDA OOM 退出码 `2` 与友好建议、CPU 训练单测 |
 | T3-09 | 事件 `jobId/sequence/timestamp/schemaVersion`，以及状态和历史查询 | 完成 | `0b311c4` | 统一对外事件信封 + `TrainingJobEvent` 有界历史表 + `GET /api/training/{jobId}/events` |
 
+### 评审修复进度
+
+| 编号 | 内容 | 状态 | 相关提交 | 备注 |
+| --- | --- | --- | --- | --- |
+| B1 | `reset()` 竞态（`runGeneration` 进程代数）与终态新建任务语义（方案A） | 未开始 | | |
+| B2 | `launchWorkerForSlotOwner()` 捕获 `RuntimeException` 释放槽位并晋升队列 | 未开始 | | |
+| B3 | 交接文档与 PR 描述补充成员4前端适配清单（合并前置条件） | 未开始 | | |
+| S1 | 接入 `release-slot-on-pause` 配置（暂停释放槽位、恢复重申槽位/排队） | 未开始 | | |
+| S2 | `jobTimeout` 仅累计实际运行时间（暂停停止计时、恢复续计） | 未开始 | | |
+| S3 | 事件持久化减少锁内 DB 写入与按间隔批量裁剪历史事件 | 未开始 | | |
+| S4 | 恢复 `TrainingJobService.java` 与 `application.yml` 的 `i/crlf` 换行符 | 完成 | 本次提交 | 消除约 1490 行纯换行符虚增 diff |
+| 次要项 | 启动恢复单次执行、真实 `exitCode` 回写、终态内存清理、幂等前置校验、Python 路径冲突提示 | 未开始 | | |
+
 ## 现状核查（已复核，基于 main @ 32a7d80）
 
 - `backend/spring/.../training/TrainingJobService.java`（1045 行）
@@ -167,3 +180,4 @@
 - 2026-11-14 15:42（member3-agent）：完成 T3-09（对外事件统一补齐 `jobId/sequence/timestamp/schemaVersion`、`TrainingJobEvent` 有界历史持久化、`GET /api/training/{jobId}/events` 增量查询与 `TrainingEventStreamAndHistoryTest`，`mvn test` 17 项与 `pytest` 7 项全部通过，提交 `0b311c4`）。
 - 2026-11-14 15:50（member3-agent）：新增真实 OS 子进程 `FakeWorkerMain` 与 `TrainingEndToEndIntegrationTest`（`@SpringBootTest` + `MockMvc` 覆盖 B 模式完整训练保存闭环、HTTP 409/429/422 错误契约、`NetworkValidator` 钩子与进程回收），全套 19 项 Java 测试与 7 项 Python pytest 测试全部通过，提交 `655b698`。
 - 2026-11-14 16:00（member3-agent）：执行 `git push -u origin feature/member3-training-job-control` 时因后台非交互环境无法弹出 GitHub HTTPS 凭据认证而阻塞，且本机无 `gh` CLI；按第 6 节规范取消挂起命令、记录状态并提供手动推送与创建 PR 命令。
+- 2026-11-14 16:17（member3-followup-agent）：开始处理代码评审意见；首先完成 S4，将 `TrainingJobService.java` 与 `application.yml` 恢复为与 `origin/main` 一致的 `i/crlf`（两文件相对 `origin/main` 的 diff 从 `2037+/1090-` 降至 `1292+/345-`），并执行 `mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（19 项通过）与 `pytest tests -q`（7 项通过）。
