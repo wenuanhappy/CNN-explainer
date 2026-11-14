@@ -325,4 +325,68 @@ class TrainingFailureAndRecoveryTest {
     TrainingStartResponse afterRestart = activeService.start(TrainingTestFixtures.sampleStartRequest(32, 2), "alice");
     assertThat(afterRestart.status()).isEqualTo("running");
   }
+
+  @Test
+  void jobTimeoutAccumulatesOnlyRunningDurationAndStopsCountingWhilePaused() throws Exception {
+    TrainingProperties props = new TrainingProperties();
+    props.setJobsRoot(tempDir.resolve("jobs-pause-timeout").toString());
+    props.setMaxConcurrentJobs(1);
+    props.setMaxQueueSize(2);
+    props.setMaxActiveJobsPerUser(4);
+    props.setJobTimeout(Duration.ofMillis(280));
+
+    ControllableTrainingProcessLauncher launcher = new ControllableTrainingProcessLauncher();
+    activeService = new TrainingJobService(
+        TrainingTestFixtures.mockDatasetService(),
+        userRepository,
+        checkpointRepository,
+        jobRepository,
+        (req, ds) -> {},
+        launcher,
+        props,
+        new ObjectMapper(),
+        tempDir.resolve("datasets").toString()
+    );
+
+    TrainingStartResponse started = activeService.start(TrainingTestFixtures.sampleStartRequest(32, 8), "alice");
+    FakeWorkerProcess worker = launcher.awaitProcess(started.jobId(), Duration.ofSeconds(2));
+
+    // Consume ~90ms of running budget (~190ms remaining)
+    Thread.sleep(90);
+
+    activeService.pause("alice", started.jobId());
+    worker.emitControl("paused", "Paused during lecture.");
+    TrainingTestFixtures.awaitUntil(
+        Duration.ofSeconds(2),
+        () -> "paused".equals(activeService.status("alice", started.jobId()).status()),
+        "Expected job to enter paused status"
+    );
+
+    // Stay paused for 380ms (well past original 280ms wall-clock timeout); must NOT time out while paused!
+    Thread.sleep(380);
+    assertThat(activeService.status("alice", started.jobId()).status()).isEqualTo("paused");
+    assertThat(activeService.status("alice", started.jobId()).errorCode()).isNull();
+    assertThat(worker.wasForciblyDestroyed()).isFalse();
+
+    // Resume -> remaining ~190ms running budget resumes and expires shortly after
+    activeService.resume("alice", started.jobId());
+    worker.emitControl("running", "Resumed.");
+    TrainingTestFixtures.awaitUntil(
+        Duration.ofSeconds(2),
+        () -> "running".equals(activeService.status("alice", started.jobId()).status()),
+        "Expected job to resume running"
+    );
+
+    TrainingTestFixtures.awaitUntil(
+        Duration.ofSeconds(2),
+        () -> "failed".equals(activeService.status("alice", started.jobId()).status()),
+        "Expected job to fail with JOB_TIMEOUT once remaining active budget expires"
+    );
+    TrainingStatusResponse timedOut = activeService.status("alice", started.jobId());
+    assertThat(timedOut.errorCode()).isEqualTo("JOB_TIMEOUT");
+    assertThat(timedOut.errorReason()).contains("cumulative running duration");
+    assertThat(worker.wasForciblyDestroyed()).isTrue();
+    assertThat(activeService.activeSlotCount()).isEqualTo(0);
+    assertThat(activeService.activeManagedProcessCount()).isEqualTo(0);
+  }
 }

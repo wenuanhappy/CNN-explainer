@@ -890,10 +890,32 @@ public class TrainingJobService {
     if (timeout == null || timeout.isZero() || timeout.isNegative()) {
       return;
     }
+    runtime.initializeJobTimeoutLocked(timeout.toNanos());
+    scheduleRemainingJobTimeoutLocked(runtime, runGeneration, timeout);
+  }
+
+  private void resumeJobTimeoutLocked(ManagedJobRuntime runtime, long runGeneration) {
+    Duration timeout = properties.getJobTimeout();
+    if (timeout == null || timeout.isZero() || timeout.isNegative()) {
+      return;
+    }
+    runtime.markJobTimeoutResumedLocked(timeout.toNanos());
+    scheduleRemainingJobTimeoutLocked(runtime, runGeneration, timeout);
+  }
+
+  private void scheduleRemainingJobTimeoutLocked(
+      ManagedJobRuntime runtime,
+      long runGeneration,
+      Duration configuredTimeout
+  ) {
+    long remainingNanos = runtime.remainingJobTimeoutNanosLocked();
+    if (remainingNanos <= 0L) {
+      remainingNanos = 1L;
+    }
     ScheduledFuture<?> future = timerExecutor.schedule(
-        () -> onJobTimeout(runtime, runGeneration, timeout),
-        timeout.toMillis(),
-        TimeUnit.MILLISECONDS
+        () -> onJobTimeout(runtime, runGeneration, configuredTimeout),
+        remainingNanos,
+        TimeUnit.NANOSECONDS
     );
     runtime.setJobTimeoutFuture(future);
   }
@@ -945,9 +967,9 @@ public class TrainingJobService {
       return;
     }
     List<ScheduledLaunch> promoted = new ArrayList<>();
-    String reason = "Training job exceeded maximum allowed duration of " + timeout + ".";
+    String reason = "Training job exceeded maximum cumulative running duration of " + timeout + ".";
     synchronized (schedulerLock) {
-      if (!runtime.isActiveRunGeneration(runGeneration) || runtime.statusEnum().isTerminal()) {
+      if (!runtime.isActiveRunGeneration(runGeneration) || runtime.statusEnum() != TrainingJobStatus.RUNNING) {
         return;
       }
       ManagedWorkerProcess terminatedProc = runtime.invalidateRunGenerationAndDestroyProcessLocked();
@@ -1067,6 +1089,7 @@ public class TrainingJobService {
           case "paused" -> {
             if (current == TrainingJobStatus.RUNNING
                 && TrainingJobStateMachine.canTransition(current, TrainingJobStatus.PAUSED)) {
+              runtime.pauseJobTimeoutLocked();
               String nextPending = runtime.pendingControlEnum() == TrainingControlAction.STOP
                   ? TrainingControlAction.STOP.wireValue()
                   : null;
@@ -1085,6 +1108,7 @@ public class TrainingJobService {
                   ? TrainingControlAction.STOP.wireValue()
                   : null;
               transitionJobWithPendingLocked(runtime, TrainingJobStatus.RUNNING, nextPending, null, null, null);
+              resumeJobTimeoutLocked(runtime, runGeneration);
             }
           }
           case "completed" -> {
@@ -1906,6 +1930,9 @@ public class TrainingJobService {
     private volatile ManagedWorkerProcess process;
     private volatile ScheduledFuture<?> jobTimeoutFuture;
     private volatile ScheduledFuture<?> stopTimeoutFuture;
+    private long remainingJobTimeoutNanos = -1L;
+    private long activeRunStartedAtNanos = 0L;
+    private boolean runningSegmentActive = false;
     private volatile String lastWorkerErrorCode;
     private volatile String lastWorkerErrorMessage;
     private final ArrayDeque<SequencedEventRecord> recentEvents = new ArrayDeque<>();
@@ -2060,7 +2087,39 @@ public class TrainingJobService {
       return current;
     }
 
+    private void initializeJobTimeoutLocked(long totalTimeoutNanos) {
+      this.remainingJobTimeoutNanos = totalTimeoutNanos;
+      this.activeRunStartedAtNanos = System.nanoTime();
+      this.runningSegmentActive = true;
+    }
+
+    private void pauseJobTimeoutLocked() {
+      ScheduledFuture<?> jf = jobTimeoutFuture;
+      jobTimeoutFuture = null;
+      if (jf != null) {
+        jf.cancel(false);
+      }
+      if (runningSegmentActive && remainingJobTimeoutNanos > 0L) {
+        long elapsedNanos = Math.max(0L, System.nanoTime() - activeRunStartedAtNanos);
+        remainingJobTimeoutNanos = Math.max(1L, remainingJobTimeoutNanos - elapsedNanos);
+      }
+      runningSegmentActive = false;
+    }
+
+    private void markJobTimeoutResumedLocked(long fallbackTotalNanos) {
+      if (remainingJobTimeoutNanos < 0L) {
+        remainingJobTimeoutNanos = fallbackTotalNanos;
+      }
+      this.activeRunStartedAtNanos = System.nanoTime();
+      this.runningSegmentActive = true;
+    }
+
+    private long remainingJobTimeoutNanosLocked() {
+      return remainingJobTimeoutNanos;
+    }
+
     private void cancelTimers() {
+      runningSegmentActive = false;
       ScheduledFuture<?> jf = jobTimeoutFuture;
       jobTimeoutFuture = null;
       if (jf != null) {
