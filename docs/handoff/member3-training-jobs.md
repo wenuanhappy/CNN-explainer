@@ -5,9 +5,9 @@
 ## 基本信息
 
 - 分支：`feature/member3-training-job-control`（基于 `origin/main` @ `32a7d80`）
-- 最近更新：2026-11-14 15:50 by member3-agent
-- 当前状态：待评审（P0 任务 T3-01 ~ T3-09 与 AC-03.1 ~ AC-03.5 全部完成并通过 19 项 Java + 7 项 Python 自动化测试）
-- PR：待创建（本机未安装 `gh` CLI，分支推送后可通过下方 `gh pr create` 命令或 GitHub Compare 链接一键提交向 `main` 的 PR）
+- 最近更新：2026-11-14 16:00 by member3-agent
+- 当前状态：待评审（本地分支已完成 T3-01 ~ T3-09 与 AC-03.1 ~ AC-03.5 全部提交并通过 19 项 Java + 7 项 Python 测试；后台非交互 `git push` 等待 GitHub HTTPS 凭据弹窗阻塞且本机无 `gh` CLI，已按规范停止并附上手动推送与提 PR 命令）
+- PR：待手动推送分支并创建（见下方「下一步」）
 - 任务依据：《DeepVision Studio 五人小组任务分工与验收安排》第 6 节（成员3），只做 P0，不做 P1
 
 ## 任务进度
@@ -141,10 +141,14 @@
 
 ## 下一步（按优先级，下一个 agent 从这里开始）
 
-1. 在已安装并登录 `gh` 的环境中执行创建 PR 命令（或直接在浏览器打开 `https://github.com/CiaCrystal/CNN-explainer/compare/main...feature/member3-training-job-control?expand=1` 提交 PR）：
+1. 在交互式终端手动完成分支推送与创建 PR（因仓库为公开仓库，`git fetch` 无需认证，而后台非交互终端执行 `git push` 时 Git Credential Manager 等待交互式 GitHub 凭据导致挂起，且本机未安装 `gh` CLI；按规范不绕过权限）：
    ```powershell
+   cd c:\Users\BCA\Desktop\code\CNN-explainer
+   git push -u origin feature/member3-training-job-control
+   # 若已安装并登录 gh CLI：
    gh pr create --base main --head feature/member3-training-job-control --title "feat(training): implement P0 training job lifecycle, resource limits, and recovery (T3-01..T3-09)"
    ```
+   推送成功后也可直接打开：`https://github.com/CiaCrystal/CNN-explainer/compare/main...feature/member3-training-job-control?expand=1` 粘贴 PR 描述提交。
 2. 代码评审与联调对齐：
    - 与成员2对齐 `TrainingErrorResponse`（`code/message/details/requestId`）全局收敛及 `NetworkValidator` Bean 接入；
    - 与成员4对齐 `queued / failed / interrupted` 状态、`pendingControl` 过渡指示、`Idempotency-Key` 请求头与 `/events?afterSequence=N` 增量拉取；
@@ -161,4 +165,5 @@
 - 2026-11-14 15:19（member3-agent）：完成 T3-06 & T3-07（全路径异常清理、槽位回收、重启恢复 `interrupted` 与 `TrainingFailureAndRecoveryTest` 验收 AC-03.4/AC-03.5，`mvn test` 与 `pytest` 均通过，提交 `24d0730`）。
 - 2026-11-14 15:26（member3-agent）：完成 T3-08（`training_worker.py` 设备上报、控制确认事件、CUDA OOM 友好提示与退出码，消除 Java stdout 与 `waitFor` 尾行竞态，`mvn test` 15 项与 `pytest` 7 项全部通过，提交 `83339a2`）。
 - 2026-11-14 15:42（member3-agent）：完成 T3-09（对外事件统一补齐 `jobId/sequence/timestamp/schemaVersion`、`TrainingJobEvent` 有界历史持久化、`GET /api/training/{jobId}/events` 增量查询与 `TrainingEventStreamAndHistoryTest`，`mvn test` 17 项与 `pytest` 7 项全部通过，提交 `0b311c4`）。
-- 2026-11-14 15:50（member3-agent）：新增真实 OS 子进程 `FakeWorkerMain` 与 `TrainingEndToEndIntegrationTest`（`@SpringBootTest` + `MockMvc` 覆盖 B 模式完整训练保存闭环、HTTP 409/429/422 错误契约、`NetworkValidator` 钩子与进程回收），全套 19 项 Java 测试与 7 项 Python pytest 测试全部通过；执行分支推送并因本机无 `gh` CLI 停在手动提交 PR 步骤。
+- 2026-11-14 15:50（member3-agent）：新增真实 OS 子进程 `FakeWorkerMain` 与 `TrainingEndToEndIntegrationTest`（`@SpringBootTest` + `MockMvc` 覆盖 B 模式完整训练保存闭环、HTTP 409/429/422 错误契约、`NetworkValidator` 钩子与进程回收），全套 19 项 Java 测试与 7 项 Python pytest 测试全部通过，提交 `655b698`。
+- 2026-11-14 16:00（member3-agent）：执行 `git push -u origin feature/member3-training-job-control` 时因后台非交互环境无法弹出 GitHub HTTPS 凭据认证而阻塞，且本机无 `gh` CLI；按第 6 节规范取消挂起命令、记录状态并提供手动推送与创建 PR 命令。
