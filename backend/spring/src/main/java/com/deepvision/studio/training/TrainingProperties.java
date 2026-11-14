@@ -52,7 +52,7 @@ public class TrainingProperties {
   public Duration getStopTimeout() { return stopTimeout == null ? Duration.ofSeconds(10) : stopTimeout; }
   public void setStopTimeout(Duration stopTimeout) { this.stopTimeout = stopTimeout; }
 
-  public int getMaxHistoryEvents() { return Math.max(10, maxHistoryEvents); }
+  public int getMaxHistoryEvents() { return Math.max(1, maxHistoryEvents); }
   public void setMaxHistoryEvents(int maxHistoryEvents) { this.maxHistoryEvents = maxHistoryEvents; }
 
   public boolean isReleaseSlotOnPause() { return releaseSlotOnPause; }

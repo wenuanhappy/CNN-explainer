@@ -5,8 +5,8 @@
 ## 基本信息
 
 - 分支：`feature/member3-training-job-control`（基于 `origin/main` @ `32a7d80`）
-- 最近更新：2026-11-14 15:26 by member3-agent
-- 当前状态：进行中（已完成 T3-01 ~ T3-08，正在推进 T3-09）
+- 最近更新：2026-11-14 15:42 by member3-agent
+- 当前状态：进行中（已完成 T3-01 ~ T3-09 全部功能实现，正在补全端到端 MockMvc + 真实子进程集成测试）
 - PR：未创建
 - 任务依据：《DeepVision Studio 五人小组任务分工与验收安排》第 6 节（成员3），只做 P0，不做 P1
 
@@ -21,8 +21,8 @@
 | T3-05 | 控制受理与 worker 执行确认分离 | 完成 | `0a4d9bf` | `pause/resume/stop` 返回已受理并置 `pendingControl`，经 worker `control` 事件确认后切最终态；`stopTimeout` 超时强杀；终态 `resume` 返 409 |
 | T3-06 | 启动失败、非零退出、停止超时、残留进程、槽位释放 | 完成 | `24d0730` | 覆盖启动异常、非零退出、`jobTimeout`、`stopTimeout`、子进程树清理与全路径槽位回收 |
 | T3-07 | 重启后未知活动任务标记 interrupted | 完成 | `24d0730` | 启动时扫描无受管存活进程的 `queued/running/paused` 任务置为 `interrupted`（不做续训） |
-| T3-08 | 实际设备上报、友好的 OOM 提示、CPU 路径 | 完成 | 本次提交 | worker 上报 `device`（`cuda`/`cpu`）、补全 `paused/running/stopped` 确认、CUDA OOM 退出码 `2` 与友好建议、CPU 训练单测 |
-| T3-09 | 事件 `jobId/sequence/timestamp/schemaVersion`，以及状态和历史查询 | 未开始 | | |
+| T3-08 | 实际设备上报、友好的 OOM 提示、CPU 路径 | 完成 | `83339a2` | worker 上报 `device`（`cuda`/`cpu`）、补全 `paused/running/stopped` 确认、CUDA OOM 退出码 `2` 与友好建议、CPU 训练单测 |
+| T3-09 | 事件 `jobId/sequence/timestamp/schemaVersion`，以及状态和历史查询 | 完成 | 本次提交 | 统一对外事件信封 + `TrainingJobEvent` 有界历史表 + `GET /api/training/{jobId}/events` |
 
 ## 现状核查（已复核，基于 main @ 32a7d80）
 
@@ -48,17 +48,20 @@
 3. **2026-11-14（T3-02 暂停资源策略预告）**：默认 `paused` 状态的任务**继续占用执行槽位**（可通过配置项 `deepvision.training.release-slot-on-pause=false` 控制），原因是暂停期间 Python/PyTorch 子进程仍驻留内存/显存持有模型参数与优化器状态，若释放槽位启动新训练极易导致显存溢出（OOM）。
 4. **2026-11-14（T3-04 幂等键传递方式预告）**：选择通过 HTTP 请求头 `Idempotency-Key` 传入幂等键，避免修改与成员2共用的 `StartTrainingRequest` 请求体结构减少合并冲突。
 5. **2026-11-14（T3-03 容量调度与可替换进程启动器）**：抽离 `TrainingProcessLauncher` + `ManagedWorkerProcess` 接口，默认使用 `DefaultTrainingProcessLauncher` 启动 OS 子进程，测试中注入 `ControllableTrainingProcessLauncher` 以脱离真实 GPU/Python 完成确定性并发验收；同时将 `application.yml` 中历史遗留的个人绝对路径 `C:/Users/lizihan/...` 清理为 `${DEEPVISION_TRAINING_PYTHON:python}`。
+6. **2026-11-14（T3-09 事件单调序号与有界历史存储）**：所有对外事件（包括 worker 输出的 `metric / control / test_result / backprop / error` 以及服务端生成的排队、停止超时、任务超时、非零退出、服务重启 `interrupted` 合成事件）均在 `schedulerLock` 内原子递增 `TrainingJob.lastSequence`（从 `1` 开始单调递增，跨 `reset` 亦不回退）并统一注入 `jobId`、`sequence`、ISO-8601 `timestamp`、`schemaVersion: "1.0"`。事件同时写入内存环形缓冲与 H2 表 `training_job_events`，每次写入自动裁剪保留最近 `max-history-events`（默认 240）条，既支持重启后按 `afterSequence` 增量查询，又防止表无限膨胀。
 
 ## 接口与协议变更（给成员2/4/5）
 
-- 新增/变更的 REST 接口：（T3-09 将新增 `GET /api/training/{jobId}/events`）
+- 新增/变更的 REST 接口：
+  - 新增 `GET /api/training/{jobId}/events?afterSequence=0&limit=100`：仅任务所属用户可查询，返回有界历史事件列表 `TrainingEventsResponse`（含 `jobId`、`status`、`schemaVersion`、`lastSequence`、`earliestAvailableSequence`、`truncated`、`events`）；当客户端传入的 `afterSequence` 早于已裁剪窗口时 `truncated=true`。
 - 请求头/请求体字段：支持请求头 `X-Request-Id` 透传或自动生成；`POST /api/training/start` 新增可选请求头 `Idempotency-Key`（长度 ≤ 128，同用户同键同配置幂等返回既有任务并将 `idempotentReplay` 置为 `true`；同用户同键但配置 `configDigest` 不同返回 HTTP 409 `IDEMPOTENCY_KEY_CONFLICT`）。
 - 响应字段新增（全部向后兼容保留旧字段）：
   - `TrainingStartResponse` 新增：`configDigest`、`idempotentReplay`、`queuePosition`
   - `TrainingStatusResponse` 新增：`pendingControl`、`device`、`lastSequence`、`exitCode`、`errorCode`、`errorReason`、`configDigest`、`createdAt`、`startedAt`、`updatedAt`、`finishedAt`
   - `TrainingControlResponse` 新增：`pendingControl`、`accepted`
+  - 新增 `TrainingEventsResponse`：`jobId`、`status`、`schemaVersion`、`lastSequence`、`earliestAvailableSequence`、`truncated`、`events`
 - 状态枚举：`queued / running / paused / completed / stopped / failed / interrupted`，配合 `pendingControl`（`pause / resume / stop / null`）表示控制请求已受理待确认；暂停默认继续占用执行槽位。
-- 事件字段：（T3-09 将统一补齐 `jobId / sequence / timestamp / schemaVersion`）
+- 事件字段：所有 WebSocket 推送事件与 `/events` 历史事件在完全保留原有字段（`type / status / message / epoch / batch / loss / accuracy / ...`）基础上，统一包含 `jobId`、`sequence`（每任务从 1 单调递增）、`timestamp`（ISO-8601 UTC 字符串）、`schemaVersion`（`"1.0"`，待与成员2确认）。`control` 与 `error` 事件新增可选 `device`、`errorCode`、`previousStatus`、`queuePosition`。
 - 错误码与错误结构（`code/message/details/requestId`，**临时约定，待成员2确认**）：`TrainingErrorResponse` 同时保留旧版 `error` 同名镜像字段，已启用 `INVALID_STATE_TRANSITION`（HTTP 409）、`IDEMPOTENCY_KEY_CONFLICT`（HTTP 409）、`TRAINING_CAPACITY_EXCEEDED`（HTTP 429）、`USER_ACTIVE_JOB_LIMIT_EXCEEDED`（HTTP 429）、`WORKER_START_FAILED`（HTTP 500）。
 - 成员2网络校验接入点：`com.deepvision.studio.training.NetworkValidator` 接口（默认由 `TrainingValidationConfig` 提供 `@ConditionalOnMissingBean` 放行实现；成员2只需注册自己的 `NetworkValidator` Bean 即可在创建进程与占用槽位前自动拦截非法网络）。
 - 配置项及默认值（`application.yml` 下 `deepvision.training.*`，均支持环境变量覆盖）：
@@ -105,6 +108,9 @@
 - `backend/python-training/training_worker.py`（仅改执行与控制部分：启动与控制事件上报 `device`、暂停/恢复/batch 内停止确认修复、CUDA OOM 捕获与退出码 `2`、常规错误退出码 `1`，未触碰模型构建与协议解析）
 - `backend/python-training/tests/test_training_worker_control.py`（扩充为 7 项 pytest 单测：覆盖设备选择、暂停/恢复/停止确认、batch 级立即停止、CUDA OOM 提示与退出码、小规模 CPU 训练闭环）
 - `backend/spring/src/test/java/com/deepvision/studio/training/TrainingDeviceAndOomTest.java`（新增，设备落库与 CUDA OOM 状态/退出码传播单测）
+- `backend/spring/src/main/java/com/deepvision/studio/training/TrainingJobEvent.java`（新增，任务有界事件历史 JPA 实体）
+- `backend/spring/src/main/java/com/deepvision/studio/training/TrainingJobEventRepository.java`（新增，按序号增量查询与窗口裁剪 Repository）
+- `backend/spring/src/test/java/com/deepvision/studio/training/TrainingEventStreamAndHistoryTest.java`（新增，T3-09 事件信封、增量查询、有界裁剪与重启查询单测）
 
 ## 运行与测试方法
 
@@ -133,8 +139,8 @@
 
 ## 下一步（按优先级，下一个 agent 从这里开始）
 
-1. 实现 T3-09：对外事件统一注入 `jobId / sequence / timestamp / schemaVersion`，持久化有界事件历史并暴露 `GET /api/training/{jobId}/events?afterSequence=N`。
-2. 补全端到端真实 OS 子进程与 MockMvc 契约集成测试，运行全套 `mvn test` 与 `pytest`，推送分支并创建 PR。
+1. 补全端到端真实 OS 子进程与 MockMvc 契约集成测试（含 B 模式正常「启动 → 完成 → 保存 checkpoint」回归校验与 `NetworkValidator` 拦截回归），运行全套 `mvn test` 与 `pytest`。
+2. 推送 `feature/member3-training-job-control` 分支并创建向 `main` 的 PR（或若本机缺少 `gh` CLI，记录状态并给出手动创建 PR 命令）。
 
 ## 会话日志
 
@@ -143,6 +149,7 @@
 - 2026-11-14 14:55（member3-agent）：完成 T3-02（`TrainingJobStatus`、`TrainingControlAction`、`TrainingJobStateMachine` 集中转换表与暂停占槽策略、统一错误契约 `TrainingErrorResponse`、`NetworkValidator` 扩展接口及单测，提交 `4249500`）。
 - 2026-11-14 15:08（member3-agent）：完成 T3-03（`TrainingProperties`、`TrainingProcessLauncher`、并发槽位与有界队列调度、`TrainingCapacityAndQueueTest` 验收 AC-03.2，`mvn test` 与 `pytest` 均通过，提交 `4760840`）。
 - 2026-11-14 15:11（member3-agent）：完成 T3-04（`Idempotency-Key` 幂等启动、配置摘要冲突 409 拦截与 `TrainingIdempotencyTest` 验收 AC-03.1，`mvn test` 与 `pytest` 均通过，提交 `082b725`）。
-- 2026-11-14 15:15（member3-agent）：完成 T3-05（控制请求受理与 worker 执行确认分离、`stopTimeout` 强杀兜底、终态 `resume` 409 校验与 `TrainingControlConfirmationTest` 验收 AC-03.3，`mvn test` 与 `pytest` 均通过，提交 `0a4d9bf`）。
+- 2026-11-14 15:15（member3-agent）：完成 T3-05（控制请求受理与 worker 执行确认分离、`stopTimeout` 强杀兜底、终态 `resume` 409 校验与 `TrainingControlConfirmationTest` 验收 AC-03.3，`mvn test` 与 `pytest` 均通过，提交 `082b725` -> `0a4d9bf`）。
 - 2026-11-14 15:19（member3-agent）：完成 T3-06 & T3-07（全路径异常清理、槽位回收、重启恢复 `interrupted` 与 `TrainingFailureAndRecoveryTest` 验收 AC-03.4/AC-03.5，`mvn test` 与 `pytest` 均通过，提交 `24d0730`）。
-- 2026-11-14 15:26（member3-agent）：完成 T3-08（`training_worker.py` 设备上报、控制确认事件、CUDA OOM 友好提示与退出码，消除 Java stdout 与 `waitFor` 尾行竞态，`mvn test` 15 项与 `pytest` 7 项全部通过）。
+- 2026-11-14 15:26（member3-agent）：完成 T3-08（`training_worker.py` 设备上报、控制确认事件、CUDA OOM 友好提示与退出码，消除 Java stdout 与 `waitFor` 尾行竞态，`mvn test` 15 项与 `pytest` 7 项全部通过，提交 `83339a2`）。
+- 2026-11-14 15:42（member3-agent）：完成 T3-09（对外事件统一补齐 `jobId/sequence/timestamp/schemaVersion`、`TrainingJobEvent` 有界历史持久化、`GET /api/training/{jobId}/events` 增量查询与 `TrainingEventStreamAndHistoryTest`，`mvn test` 17 项与 `pytest` 7 项全部通过）。

@@ -248,6 +248,17 @@ public final class TrainingDtos {
     }
   }
 
+  @Schema(description = "Bounded training event history response")
+  public record TrainingEventsResponse(
+      String jobId,
+      String status,
+      String schemaVersion,
+      long lastSequence,
+      Long earliestAvailableSequence,
+      boolean truncated,
+      List<JsonNode> events
+  ) {}
+
   @Schema(description = "Weight histogram bin")
   public record HistogramBin(String label, int count) {}
 

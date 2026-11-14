@@ -13,6 +13,7 @@ import com.deepvision.studio.training.TrainingDtos.TrainingControlResponse;
 import com.deepvision.studio.training.TrainingDtos.TrainingDatasetDetail;
 import com.deepvision.studio.training.TrainingDtos.TrainingDatasetOption;
 import com.deepvision.studio.training.TrainingDtos.TrainingErrorResponse;
+import com.deepvision.studio.training.TrainingDtos.TrainingEventsResponse;
 import com.deepvision.studio.training.TrainingDtos.TrainingStartResponse;
 import com.deepvision.studio.training.TrainingDtos.TrainingStatusResponse;
 import com.deepvision.studio.training.TrainingDtos.WeightHistogramResponse;
@@ -217,6 +218,19 @@ public class TrainingController {
   @Operation(summary = "Get training job status")
   public TrainingStatusResponse status(Principal principal, @PathVariable String jobId) {
     return jobService.status(username(principal), jobId);
+  }
+
+  @GetMapping("/{jobId}/events")
+  @Operation(summary = "Get bounded training job event history after a given sequence")
+  @ApiResponse(responseCode = "200", description = "Bounded list of sequenced training events")
+  @ApiResponse(responseCode = "400", description = "Job not found or query parameters invalid")
+  public TrainingEventsResponse events(
+      Principal principal,
+      @PathVariable String jobId,
+      @RequestParam(value = "afterSequence", required = false, defaultValue = "0") long afterSequence,
+      @RequestParam(value = "limit", required = false, defaultValue = "100") int limit
+  ) {
+    return jobService.events(username(principal), jobId, afterSequence, limit);
   }
 
   @PostMapping("/{jobId}/pause")
