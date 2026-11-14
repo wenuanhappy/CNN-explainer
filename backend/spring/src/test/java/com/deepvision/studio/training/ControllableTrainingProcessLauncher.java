@@ -62,6 +62,10 @@ public class ControllableTrainingProcessLauncher implements TrainingProcessLaunc
     return count;
   }
 
+  public List<FakeWorkerProcess> allProcesses() {
+    return List.copyOf(allProcesses);
+  }
+
   public FakeWorkerProcess getProcess(String jobId) {
     return processesByJobId.get(jobId);
   }
@@ -87,6 +91,7 @@ public class ControllableTrainingProcessLauncher implements TrainingProcessLaunc
     private final CountDownLatch exitLatch = new CountDownLatch(1);
     private final AtomicBoolean alive = new AtomicBoolean(true);
     private final AtomicBoolean forciblyDestroyed = new AtomicBoolean(false);
+    private volatile boolean delayExitOnDestroy = false;
     private volatile int exitCode = 0;
 
     public FakeWorkerProcess(WorkerLaunchRequest request) {
@@ -97,6 +102,17 @@ public class ControllableTrainingProcessLauncher implements TrainingProcessLaunc
       return request;
     }
 
+    public void setDelayExitOnDestroy(boolean delayExitOnDestroy) {
+      this.delayExitOnDestroy = delayExitOnDestroy;
+    }
+
+    public void completeDelayedExit(int code) {
+      this.exitCode = code;
+      alive.set(false);
+      outputChunks.offer(EOF);
+      exitLatch.countDown();
+    }
+
     public String readControlCommand() {
       try {
         if (!Files.exists(request.controlFile())) {
@@ -104,6 +120,20 @@ public class ControllableTrainingProcessLauncher implements TrainingProcessLaunc
         }
         JsonNode node = MAPPER.readTree(Files.readString(request.controlFile(), StandardCharsets.UTF_8));
         return node.path("command").asText(null);
+      } catch (IOException ex) {
+        throw new RuntimeException(ex);
+      }
+    }
+
+    public void emitTrailingErrorBeforeDelayedExit(String errorCode, String message) {
+      try {
+        String raw = MAPPER.writeValueAsString(Map.of(
+            "type", "error",
+            "jobId", request.jobId(),
+            "errorCode", errorCode,
+            "message", message
+        ));
+        outputChunks.offer((raw + "\n").getBytes(StandardCharsets.UTF_8));
       } catch (IOException ex) {
         throw new RuntimeException(ex);
       }
@@ -210,6 +240,10 @@ public class ControllableTrainingProcessLauncher implements TrainingProcessLaunc
     @Override
     public void destroyForcibly() {
       forciblyDestroyed.set(true);
+      if (delayExitOnDestroy) {
+        alive.set(false);
+        return;
+      }
       finish(137);
     }
   }

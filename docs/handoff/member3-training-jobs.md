@@ -28,13 +28,13 @@
 
 | 编号 | 内容 | 状态 | 相关提交 | 备注 |
 | --- | --- | --- | --- | --- |
-| B1 | `reset()` 竞态（`runGeneration` 进程代数）与终态新建任务语义（方案A） | 未开始 | | |
+| B1 | `reset()` 竞态（`runGeneration` 进程代数）与终态新建任务语义（方案A） | 完成 | 本次提交 | 移除 `isCurrentProcessOrTerminated` 的 `null` 误判，改用单调 `runGeneration` 校验回调；`reset` 仅允许终态任务并复用原请求走 `start` 创建新 `jobId`（非终态返 409、保留原 `checkpoint.pt`） |
 | B2 | `launchWorkerForSlotOwner()` 捕获 `RuntimeException` 释放槽位并晋升队列 | 未开始 | | |
 | B3 | 交接文档与 PR 描述补充成员4前端适配清单（合并前置条件） | 未开始 | | |
 | S1 | 接入 `release-slot-on-pause` 配置（暂停释放槽位、恢复重申槽位/排队） | 未开始 | | |
 | S2 | `jobTimeout` 仅累计实际运行时间（暂停停止计时、恢复续计） | 未开始 | | |
 | S3 | 事件持久化减少锁内 DB 写入与按间隔批量裁剪历史事件 | 未开始 | | |
-| S4 | 恢复 `TrainingJobService.java` 与 `application.yml` 的 `i/crlf` 换行符 | 完成 | 本次提交 | 消除约 1490 行纯换行符虚增 diff |
+| S4 | 恢复 `TrainingJobService.java` 与 `application.yml` 的 `i/crlf` 换行符 | 完成 | `b4b8790` | 消除约 1490 行纯换行符虚增 diff |
 | 次要项 | 启动恢复单次执行、真实 `exitCode` 回写、终态内存清理、幂等前置校验、Python 路径冲突提示 | 未开始 | | |
 
 ## 现状核查（已复核，基于 main @ 32a7d80）
@@ -62,11 +62,15 @@
 4. **2026-11-14（T3-04 幂等键传递方式预告）**：选择通过 HTTP 请求头 `Idempotency-Key` 传入幂等键，避免修改与成员2共用的 `StartTrainingRequest` 请求体结构减少合并冲突。
 5. **2026-11-14（T3-03 容量调度与可替换进程启动器）**：抽离 `TrainingProcessLauncher` + `ManagedWorkerProcess` 接口，默认使用 `DefaultTrainingProcessLauncher` 启动 OS 子进程，测试中注入 `ControllableTrainingProcessLauncher` 以脱离真实 GPU/Python 完成确定性并发验收；同时将 `application.yml` 中历史遗留的个人绝对路径 `C:/Users/lizihan/...` 清理为 `${DEEPVISION_TRAINING_PYTHON:python}`。
 6. **2026-11-14（T3-09 事件单调序号与有界历史存储）**：所有对外事件（包括 worker 输出的 `metric / control / test_result / backprop / error` 以及服务端生成的排队、停止超时、任务超时、非零退出、服务重启 `interrupted` 合成事件）均在 `schedulerLock` 内原子递增 `TrainingJob.lastSequence`（从 `1` 开始单调递增，跨 `reset` 亦不回退）并统一注入 `jobId`、`sequence`、ISO-8601 `timestamp`、`schemaVersion: "1.0"`。事件同时写入内存环形缓冲与 H2 表 `training_job_events`，每次写入自动裁剪保留最近 `max-history-events`（默认 240）条，既支持重启后按 `afterSequence` 增量查询，又防止表无限膨胀。
+7. **2026-11-14（B1 进程代数 `runGeneration` 与 `reset` 方案A）**：
+   - **进程归属代数（`runGeneration`）**：删除把 `process == null` 当作当前进程的 `isCurrentProcessOrTerminated`；在 `schedulerLock` 内分配槽位时同步递增 `ManagedJobRuntime.runGeneration`，并在启动完成挂载 `process` 时再次在 `schedulerLock` 内核对代数与非终态（若已被取消/强杀则立即销毁子进程）。所有异步回调（`readWorkerOutput`、`waitForWorkerExit`、`onStopTimeout`、`onJobTimeout`）均携带所属 `runGeneration`，代数不一致时直接忽略，彻底杜绝旧进程延迟退出把新运行标为 `failed` 或误释放槽位。
+   - **`reset` 语义采用方案A**：经核实前端 `training-runtime.service.ts` 通过 `stop()` 实现重置、未调用 `/reset`，但为保持 REST 接口向后兼容并保护已生成的 `checkpoint.pt`，选择推荐的**方案A**——`POST /api/training/{jobId}/reset` 仅允许在终态（`completed / stopped / failed / interrupted`）调用（非终态返回 HTTP 409 `INVALID_STATE_TRANSITION`），并复用原任务的 `StartTrainingRequest` 委托 `start()` 创建全新 `jobId`（完整执行单用户活动上限、全局并发槽位与队列容量检查），原任务记录及其目录下的 `checkpoint.pt` 保持不变。
 
 ## 接口与协议变更（给成员2/4/5）
 
 - 新增/变更的 REST 接口：
   - 新增 `GET /api/training/{jobId}/events?afterSequence=0&limit=100`：仅任务所属用户可查询，返回有界历史事件列表 `TrainingEventsResponse`（含 `jobId`、`status`、`schemaVersion`、`lastSequence`、`earliestAvailableSequence`、`truncated`、`events`）；当客户端传入的 `afterSequence` 早于已裁剪窗口时 `truncated=true`。
+  - 变更 `POST /api/training/{jobId}/reset`（方案A）：仅允许对终态任务（`completed / stopped / failed / interrupted`）调用，复用原任务配置创建并返回**新 `jobId`**（`TrainingControlResponse.jobId` 为新任务 ID，`status` 为 `running` 或 `queued`，受单用户活动上限与全局并发/队列容量约束）；对非终态任务（`queued / running / paused`）调用返回 HTTP 409 `INVALID_STATE_TRANSITION`（需先 `stop` 进入终态后再 `reset`）。
 - 请求头/请求体字段：支持请求头 `X-Request-Id` 透传或自动生成；`POST /api/training/start` 新增可选请求头 `Idempotency-Key`（长度 ≤ 128，同用户同键同配置幂等返回既有任务并将 `idempotentReplay` 置为 `true`；同用户同键但配置 `configDigest` 不同返回 HTTP 409 `IDEMPOTENCY_KEY_CONFLICT`）。
 - 响应字段新增（全部向后兼容保留旧字段）：
   - `TrainingStartResponse` 新增：`configDigest`、`idempotentReplay`、`queuePosition`
@@ -126,6 +130,7 @@
 - `backend/spring/src/test/java/com/deepvision/studio/training/TrainingEventStreamAndHistoryTest.java`（新增，T3-09 事件信封、增量查询、有界裁剪与重启查询单测）
 - `backend/spring/src/test/java/com/deepvision/studio/training/FakeWorkerMain.java`（新增，零外部依赖的真实 OS 子进程测试 worker，实现完整 `request.json`/`control.json`/stdout/`checkpoint.pt` 协议）
 - `backend/spring/src/test/java/com/deepvision/studio/training/TrainingEndToEndIntegrationTest.java`（新增，`@SpringBootTest` + `MockMvc` + 真实 OS 子进程端到端验收测试，覆盖 B 模式「启动 → 暂停占槽 → 排队/429 → 停止晋升 → 完成 → 保存 checkpoint → 事件历史查询」与 `NetworkValidator` 接入契约）
+- `backend/spring/src/test/java/com/deepvision/studio/training/TrainingResetAndGenerationTest.java`（新增，B1 回归测试：覆盖非终态 `reset` 409、旧进程延迟退出与尾行输出不污染新运行/槽位、`runGeneration` 代数隔离、原 `checkpoint.pt` 不被覆盖）
 
 ## 运行与测试方法
 
@@ -139,9 +144,9 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | AC-03.1 | 内存 H2 + `ControllableTrainingProcessLauncher` 及 `@SpringBootTest` + `MockMvc` 携带 `Idempotency-Key` | `mvn -q test` 执行 `TrainingIdempotencyTest`（8 线程并发栅栏 + 顺序重试 + 异配置冲突）与 `TrainingEndToEndIntegrationTest` | 只有 1 个任务，最多 1 个进程 | 数据库仅创建 1 条 `TrainingJob`，仅启动 1 个进程，所有重试返回相同 `jobId` 且 `idempotentReplay=true`；同键异配置返回 HTTP 409 `IDEMPOTENCY_KEY_CONFLICT` | `TrainingIdempotencyTest.java`, `TrainingEndToEndIntegrationTest.java` | 通过 |
 | AC-03.2 | 测试配置：并发 2、队列 3、单用户上限 10，内存 H2 + `ControllableTrainingProcessLauncher` | `mvn -q test` 执行 `TrainingCapacityAndQueueTest` 6 线程栅栏并发提交 | 最多 2 个执行、3 个排队，其余收到容量错误 | 2 个 `running`（启动 2 个受管进程）、3 个 `queued`、1 个抛出 HTTP 429 `TRAINING_CAPACITY_EXCEEDED`；首个任务完成后队首自动晋升为 `running` | `TrainingCapacityAndQueueTest.java` | 通过 |
-| AC-03.3 | 内存 H2 + 模拟/真实 OS 子进程 worker | `mvn -q test` 执行 `TrainingControlConfirmationTest`、`TrainingEndToEndIntegrationTest` 与 `pytest` 控制单测 | 经确认后才变更状态；resume 返回 409 | 调用 `pause/resume/stop` 后仅写 `control.json` 并标记 `pendingControl`（主状态不变），worker 输出 `control` 事件后才切换为 `paused/running/stopped`；对 `completed` 任务调用 `resume` 返回 HTTP 409 `INVALID_STATE_TRANSITION`；超时未确认时强杀并记录 `STOP_TIMEOUT` | `TrainingControlConfirmationTest.java`, `TrainingEndToEndIntegrationTest.java`, `test_training_worker_control.py` | 通过 |
-| AC-03.4 | 内存 H2 + `ControllableTrainingProcessLauncher`（双实例共享同一数据库模拟重启） | `mvn -q test` 执行 `TrainingFailureAndRecoveryTest` 与 `TrainingEventStreamAndHistoryTest` | 状态为 failed / interrupted，并有原因 | 强杀 worker 后状态变为 `failed`，记录 `exitCode=137`、`errorCode=WORKER_NON_ZERO_EXIT` 及失败原因；重启后残留 `running/paused/queued` 任务全部变为 `interrupted`（`SERVICE_RESTART_INTERRUPTED`）并记录带序号恢复事件，已完成任务保持 `completed` | `TrainingFailureAndRecoveryTest.java`, `TrainingEventStreamAndHistoryTest.java` | 通过 |
-| AC-03.5 | 内存 H2 + 模拟与真实 OS 子进程（覆盖正常完成、stop、强杀、启动失败、超时） | `mvn -q test` 执行 `TrainingFailureAndRecoveryTest`、`TrainingControlConfirmationTest` 与 `TrainingEndToEndIntegrationTest` | 释放槽位，没有遗留的未知受管进程 | 所有终止路径均立即释放 `activeSlotJobIds`、自动晋升队列下一任务，且结束时 `activeSlotCount()==0`、`activeManagedProcessCount()==0`；B 模式「启动 → 完成 → 保存 checkpoint」回归通过 | `TrainingFailureAndRecoveryTest.java`, `TrainingEndToEndIntegrationTest.java` | 通过 |
+| AC-03.3 | 内存 H2 + 模拟/真实 OS 子进程 worker | `mvn -q clean test` 执行 `TrainingControlConfirmationTest`、`TrainingResetAndGenerationTest`、`TrainingEndToEndIntegrationTest` 与 `pytest` 控制单测 | 经确认后才变更状态；resume/非终态 reset 返回 409 | 调用 `pause/resume/stop` 后仅写 `control.json` 并标记 `pendingControl`（主状态不变），worker 输出 `control` 事件后才切换为 `paused/running/stopped`；对 `completed` 任务调用 `resume`、对 `running/paused/queued` 任务调用 `reset` 均返回 HTTP 409 `INVALID_STATE_TRANSITION`；超时未确认时强杀并记录 `STOP_TIMEOUT` | `TrainingControlConfirmationTest.java`, `TrainingResetAndGenerationTest.java`, `TrainingEndToEndIntegrationTest.java`, `test_training_worker_control.py` | 通过 |
+| AC-03.4 | 内存 H2 + `ControllableTrainingProcessLauncher`（双实例共享同一数据库模拟重启） | `mvn -q clean test` 执行 `TrainingFailureAndRecoveryTest` 与 `TrainingEventStreamAndHistoryTest` | 状态为 failed / interrupted，并有原因 | 强杀 worker 后状态变为 `failed`，记录 `exitCode=137`、`errorCode=WORKER_NON_ZERO_EXIT` 及失败原因；重启后残留 `running/paused/queued` 任务全部变为 `interrupted`（`SERVICE_RESTART_INTERRUPTED`）并记录带序号恢复事件，已完成任务保持 `completed` | `TrainingFailureAndRecoveryTest.java`, `TrainingEventStreamAndHistoryTest.java` | 通过 |
+| AC-03.5 | 内存 H2 + 模拟与真实 OS 子进程（覆盖正常完成、stop、reset、强杀、启动失败、超时） | `mvn -q clean test` 执行 `TrainingFailureAndRecoveryTest`、`TrainingControlConfirmationTest`、`TrainingResetAndGenerationTest` 与 `TrainingEndToEndIntegrationTest` | 释放槽位，没有遗留的未知受管进程 | 所有终止路径均立即释放 `activeSlotJobIds`、自动晋升队列下一任务；`stop` 后 `reset` 新建任务及代数替换时旧进程延迟非零退出不会误标新任务失败或误释放槽位（全程 `activeSlotCount <= 上限` 且与 `activeManagedProcessCount` 一致，原 `checkpoint.pt` 保持不变） | `TrainingFailureAndRecoveryTest.java`, `TrainingResetAndGenerationTest.java`, `TrainingEndToEndIntegrationTest.java` | 通过 |
 
 结论只能填：通过 / 失败 / 阻塞 / 未执行。
 
@@ -180,4 +185,5 @@
 - 2026-11-14 15:42（member3-agent）：完成 T3-09（对外事件统一补齐 `jobId/sequence/timestamp/schemaVersion`、`TrainingJobEvent` 有界历史持久化、`GET /api/training/{jobId}/events` 增量查询与 `TrainingEventStreamAndHistoryTest`，`mvn test` 17 项与 `pytest` 7 项全部通过，提交 `0b311c4`）。
 - 2026-11-14 15:50（member3-agent）：新增真实 OS 子进程 `FakeWorkerMain` 与 `TrainingEndToEndIntegrationTest`（`@SpringBootTest` + `MockMvc` 覆盖 B 模式完整训练保存闭环、HTTP 409/429/422 错误契约、`NetworkValidator` 钩子与进程回收），全套 19 项 Java 测试与 7 项 Python pytest 测试全部通过，提交 `655b698`。
 - 2026-11-14 16:00（member3-agent）：执行 `git push -u origin feature/member3-training-job-control` 时因后台非交互环境无法弹出 GitHub HTTPS 凭据认证而阻塞，且本机无 `gh` CLI；按第 6 节规范取消挂起命令、记录状态并提供手动推送与创建 PR 命令。
-- 2026-11-14 16:17（member3-followup-agent）：开始处理代码评审意见；首先完成 S4，将 `TrainingJobService.java` 与 `application.yml` 恢复为与 `origin/main` 一致的 `i/crlf`（两文件相对 `origin/main` 的 diff 从 `2037+/1090-` 降至 `1292+/345-`），并执行 `mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（19 项通过）与 `pytest tests -q`（7 项通过）。
+- 2026-11-14 16:17（member3-followup-agent）：开始处理代码评审意见；首先完成 S4，将 `TrainingJobService.java` 与 `application.yml` 恢复为与 `origin/main` 一致的 `i/crlf`（两文件相对 `origin/main` 的 diff 从 `2037+/1090-` 降至 `1292+/345-`），并执行 `mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（19 项通过）与 `pytest tests -q`（7 项通过），提交 `b4b8790`。
+- 2026-11-14 16:33（member3-followup-agent）：完成 B1（引入 `runGeneration` 进程代数消除旧进程回调竞态，`reset()` 采用方案A仅允许终态任务创建新 `jobId` 并保护原 `checkpoint.pt`，新增 `TrainingResetAndGenerationTest` 3 项回归测试），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（22 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过）。

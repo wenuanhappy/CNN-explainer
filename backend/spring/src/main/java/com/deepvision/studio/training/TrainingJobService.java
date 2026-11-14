@@ -218,7 +218,7 @@ public class TrainingJobService {
     String configDigest = computeConfigDigest(request);
     String requestJson = serializeRequest(request);
 
-    ManagedJobRuntime runtimeToLaunch = null;
+    ScheduledLaunch scheduledLaunch = null;
     Integer queuePosition = null;
     String queuedEventJson = null;
     String initialStatus;
@@ -316,7 +316,7 @@ public class TrainingJobService {
 
       if (hasSlot) {
         activeSlotJobIds.add(jobId);
-        runtimeToLaunch = runtime;
+        scheduledLaunch = new ScheduledLaunch(runtime, runtime.allocateRunGenerationLocked());
       } else {
         waitQueue.addLast(jobId);
         queuePosition = waitQueue.size();
@@ -333,8 +333,8 @@ public class TrainingJobService {
       broadcastRaw(jobId, queuedEventJson);
     }
 
-    if (runtimeToLaunch != null) {
-      launchWorkerForSlotOwner(runtimeToLaunch, true);
+    if (scheduledLaunch != null) {
+      launchWorkerForSlotOwner(scheduledLaunch, true);
     }
 
     return new TrainingStartResponse(
@@ -573,7 +573,7 @@ public class TrainingJobService {
           runtime.entity().setPendingControl(TrainingControlAction.STOP.wireValue());
           runtime.entity().setUpdatedAt(Instant.now());
           jobRepository.saveAndFlush(runtime.entity());
-          scheduleStopTimeout(runtime, runtime.process());
+          scheduleStopTimeoutLocked(runtime, runtime.currentRunGenerationLocked());
         }
         statusSnapshot = runtime.status();
       }
@@ -592,42 +592,78 @@ public class TrainingJobService {
   }
 
   public TrainingControlResponse reset(String jobId) {
-    return reset(requireRuntime(jobId));
+    return resetInternal(null, jobId);
   }
 
   public TrainingControlResponse reset(String username, String jobId) {
-    return reset(requireOwnedRuntime(username, jobId));
+    requireUser(username);
+    return resetInternal(username, jobId);
   }
 
-  private TrainingControlResponse reset(ManagedJobRuntime runtime) {
-    boolean launchNow = false;
+  private TrainingControlResponse resetInternal(String username, String jobId) {
+    StartTrainingRequest sourceRequest;
+    String effectiveOwner;
     synchronized (schedulerLock) {
-      writeControl(runtime, "stopped");
-      runtime.destroyProcessForcibly();
-      waitQueue.remove(runtime.jobId());
-      boolean alreadyHasSlot = activeSlotJobIds.contains(runtime.jobId());
-      if (!alreadyHasSlot && activeSlotJobIds.size() >= properties.getMaxConcurrentJobs()) {
-        if (waitQueue.size() >= properties.getMaxQueueSize()) {
-          throw new TrainingCapacityException(
-              "TRAINING_CAPACITY_EXCEEDED",
-              "No capacity available to reset training job.",
-              Map.of("jobId", runtime.jobId())
-          );
+      ManagedJobRuntime runtime = runtimes.get(jobId);
+      TrainingJob entity;
+      if (runtime != null) {
+        if (username != null && !Objects.equals(username, runtime.owner())) {
+          throw new IllegalArgumentException("Training job not found.");
         }
-        runtime.resetForRerun(TrainingJobStatus.QUEUED, null);
-        jobRepository.saveAndFlush(runtime.entity());
-        waitQueue.addLast(runtime.jobId());
+        entity = runtime.entity();
+        sourceRequest = runtime.request();
       } else {
-        activeSlotJobIds.add(runtime.jobId());
-        runtime.resetForRerun(TrainingJobStatus.RUNNING, Instant.now());
-        jobRepository.saveAndFlush(runtime.entity());
-        launchNow = true;
+        entity = (username == null
+            ? jobRepository.findById(jobId)
+            : jobRepository.findByJobIdAndOwner(jobId, username))
+            .orElseThrow(() -> new IllegalArgumentException("Training job not found."));
+        sourceRequest = deserializeRequest(entity.getRequestJson());
       }
+      TrainingJobStatus currentStatus = TrainingJobStatus.fromWireValue(entity.getStatus());
+      if (!currentStatus.isTerminal()) {
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("jobId", jobId);
+        details.put("currentStatus", currentStatus.wireValue());
+        details.put("requestedAction", "reset");
+        throw new TrainingStateConflictException(
+            "INVALID_STATE_TRANSITION",
+            "Cannot reset non-terminal training job " + jobId
+                + " in status '" + currentStatus.wireValue() + "'; stop it first.",
+            details
+        );
+      }
+      effectiveOwner = username != null ? username : entity.getOwner();
     }
-    if (launchNow) {
-      launchWorkerForSlotOwner(runtime, true);
+    TrainingStartResponse restarted = start(sourceRequest, effectiveOwner, null);
+    return new TrainingControlResponse(
+        restarted.jobId(),
+        restarted.status(),
+        "Training reset as new job " + restarted.jobId() + ".",
+        null,
+        true
+    );
+  }
+
+  // Package-private helper for testing runGeneration callback isolation on a superseded runtime.
+  void relaunchWithNewGenerationForTest(String jobId) {
+    ScheduledLaunch nextLaunch;
+    synchronized (schedulerLock) {
+      ManagedJobRuntime runtime = requireRuntime(jobId);
+      runtime.invalidateRunGenerationAndDestroyProcessLocked();
+      activeSlotJobIds.add(jobId);
+      Instant now = Instant.now();
+      runtime.entity().setStatus(TrainingJobStatus.RUNNING.wireValue());
+      runtime.entity().setPendingControl(null);
+      runtime.entity().setStartedAt(now);
+      runtime.entity().setFinishedAt(null);
+      runtime.entity().setUpdatedAt(now);
+      runtime.entity().setExitCode(null);
+      runtime.entity().setErrorCode(null);
+      runtime.entity().setErrorReason(null);
+      jobRepository.saveAndFlush(runtime.entity());
+      nextLaunch = new ScheduledLaunch(runtime, runtime.allocateRunGenerationLocked());
     }
-    return new TrainingControlResponse(runtime.jobId(), runtime.status(), "Training reset.", null, true);
+    launchWorkerForSlotOwner(nextLaunch, true);
   }
 
   public TrainingControlResponse save(String jobId) {
@@ -754,17 +790,27 @@ public class TrainingJobService {
   @PreDestroy
   void shutdown() {
     shuttingDown = true;
-    runtimes.values().forEach(ManagedJobRuntime::destroyProcessForcibly);
+    synchronized (schedulerLock) {
+      runtimes.values().forEach(ManagedJobRuntime::invalidateRunGenerationAndDestroyProcessLocked);
+    }
     timerExecutor.shutdownNow();
     workerIoExecutor.shutdownNow();
   }
 
-  private void launchWorkerForSlotOwner(ManagedJobRuntime runtime, boolean rethrowOnFailure) {
+  private void launchWorkerForSlotOwner(ScheduledLaunch launch, boolean rethrowOnFailure) {
+    ManagedJobRuntime runtime = launch.runtime();
+    long runGeneration = launch.runGeneration();
     try {
       Files.createDirectories(jobRoot);
       Files.createDirectories(runtime.directory());
       runtime.writeRequest();
-      writeControl(runtime, "running");
+      synchronized (schedulerLock) {
+        if (shuttingDown || !runtime.isActiveRunGeneration(runGeneration) || runtime.statusEnum().isTerminal()) {
+          return;
+        }
+        String initialCommand = runtime.pendingControlEnum() == TrainingControlAction.STOP ? "stopped" : "running";
+        writeControl(runtime, initialCommand);
+      }
       ManagedWorkerProcess process = processLauncher.launch(new WorkerLaunchRequest(
           runtime.jobId(),
           runtime.directory(),
@@ -772,26 +818,42 @@ public class TrainingJobService {
           runtime.controlFile(),
           runtime.checkpointFile()
       ));
-      runtime.setProcess(process);
-      scheduleJobTimeout(runtime, process);
-      Future<?> outputReaderFuture = workerIoExecutor.submit(() -> readWorkerOutput(runtime, process));
-      workerIoExecutor.submit(() -> waitForWorkerExit(runtime, process, outputReaderFuture));
+      synchronized (schedulerLock) {
+        if (shuttingDown || !runtime.isActiveRunGeneration(runGeneration) || runtime.statusEnum().isTerminal()) {
+          process.destroyForcibly();
+          return;
+        }
+        if (runtime.pendingControlEnum() == TrainingControlAction.STOP) {
+          writeControl(runtime, "stopped");
+        }
+        runtime.attachProcessLocked(runGeneration, process);
+        scheduleJobTimeoutLocked(runtime, runGeneration);
+      }
+      Future<?> outputReaderFuture = workerIoExecutor.submit(() -> readWorkerOutput(runtime, process, runGeneration));
+      workerIoExecutor.submit(() -> waitForWorkerExit(runtime, process, runGeneration, outputReaderFuture));
     } catch (IOException ex) {
       String startErrorMessage = "Failed to start Python training worker: " + ex.getMessage();
-      List<ManagedJobRuntime> promoted = new ArrayList<>();
+      List<ScheduledLaunch> promoted = new ArrayList<>();
+      boolean shouldEmitError = false;
       synchronized (schedulerLock) {
-        if (!runtime.statusEnum().isTerminal()) {
-          transitionJobLocked(
-              runtime,
-              TrainingJobStatus.FAILED,
-              null,
-              "WORKER_START_FAILED",
-              startErrorMessage
-          );
+        if (runtime.isActiveRunGeneration(runGeneration)) {
+          runtime.invalidateRunGenerationAndDestroyProcessLocked();
+          if (!runtime.statusEnum().isTerminal()) {
+            transitionJobLocked(
+                runtime,
+                TrainingJobStatus.FAILED,
+                null,
+                "WORKER_START_FAILED",
+                startErrorMessage
+            );
+            shouldEmitError = true;
+          }
+          releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
         }
-        releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
       }
-      emitSyntheticError(runtime, "WORKER_START_FAILED", startErrorMessage);
+      if (shouldEmitError) {
+        emitSyntheticError(runtime, "WORKER_START_FAILED", startErrorMessage);
+      }
       launchPromotedRuntimes(promoted);
       if (rethrowOnFailure) {
         throw new TrainingApiException(
@@ -804,47 +866,50 @@ public class TrainingJobService {
     }
   }
 
-  private void scheduleJobTimeout(ManagedJobRuntime runtime, ManagedWorkerProcess process) {
+  private void scheduleJobTimeoutLocked(ManagedJobRuntime runtime, long runGeneration) {
     Duration timeout = properties.getJobTimeout();
     if (timeout == null || timeout.isZero() || timeout.isNegative()) {
       return;
     }
-    ScheduledFuture<?> future = timerExecutor.schedule(() -> onJobTimeout(runtime, process, timeout), timeout.toMillis(), TimeUnit.MILLISECONDS);
+    ScheduledFuture<?> future = timerExecutor.schedule(
+        () -> onJobTimeout(runtime, runGeneration, timeout),
+        timeout.toMillis(),
+        TimeUnit.MILLISECONDS
+    );
     runtime.setJobTimeoutFuture(future);
   }
 
-  private void scheduleStopTimeout(ManagedJobRuntime runtime, ManagedWorkerProcess process) {
+  private void scheduleStopTimeoutLocked(ManagedJobRuntime runtime, long runGeneration) {
     Duration timeout = properties.getStopTimeout();
     if (timeout == null || timeout.isZero() || timeout.isNegative()) {
       timeout = Duration.ofMillis(1);
     }
     final Duration effectiveTimeout = timeout;
     ScheduledFuture<?> future = timerExecutor.schedule(
-        () -> onStopTimeout(runtime, process, effectiveTimeout),
+        () -> onStopTimeout(runtime, runGeneration, effectiveTimeout),
         effectiveTimeout.toMillis(),
         TimeUnit.MILLISECONDS
     );
     runtime.setStopTimeoutFuture(future);
   }
 
-  private void onStopTimeout(ManagedJobRuntime runtime, ManagedWorkerProcess process, Duration timeout) {
-    if (shuttingDown) {
+  private void onStopTimeout(ManagedJobRuntime runtime, long runGeneration, Duration timeout) {
+    if (shuttingDown || !runtime.isActiveRunGeneration(runGeneration)) {
       return;
     }
-    List<ManagedJobRuntime> promoted = new ArrayList<>();
+    List<ScheduledLaunch> promoted = new ArrayList<>();
     String reason = "Worker did not confirm stop within " + timeout + "; forcibly terminated.";
     synchronized (schedulerLock) {
-      if (runtime.statusEnum().isTerminal() || runtime.pendingControlEnum() != TrainingControlAction.STOP) {
+      if (!runtime.isActiveRunGeneration(runGeneration)
+          || runtime.statusEnum().isTerminal()
+          || runtime.pendingControlEnum() != TrainingControlAction.STOP) {
         return;
       }
-      if (process != null && !runtime.isCurrentProcessOrTerminated(process)) {
-        return;
-      }
-      runtime.destroyProcessForcibly();
+      ManagedWorkerProcess terminatedProc = runtime.invalidateRunGenerationAndDestroyProcessLocked();
       Integer forcedExit = null;
-      if (process != null && !process.isAlive()) {
+      if (terminatedProc != null && !terminatedProc.isAlive()) {
         try {
-          forcedExit = process.exitValue();
+          forcedExit = terminatedProc.exitValue();
         } catch (IllegalThreadStateException ignored) {
           // Process still terminating in OS.
         }
@@ -856,21 +921,21 @@ public class TrainingJobService {
     launchPromotedRuntimes(promoted);
   }
 
-  private void onJobTimeout(ManagedJobRuntime runtime, ManagedWorkerProcess process, Duration timeout) {
-    if (shuttingDown || !runtime.isCurrentProcess(process)) {
+  private void onJobTimeout(ManagedJobRuntime runtime, long runGeneration, Duration timeout) {
+    if (shuttingDown || !runtime.isActiveRunGeneration(runGeneration)) {
       return;
     }
-    List<ManagedJobRuntime> promoted = new ArrayList<>();
+    List<ScheduledLaunch> promoted = new ArrayList<>();
     String reason = "Training job exceeded maximum allowed duration of " + timeout + ".";
     synchronized (schedulerLock) {
-      if (runtime.statusEnum().isTerminal() || !runtime.isCurrentProcess(process)) {
+      if (!runtime.isActiveRunGeneration(runGeneration) || runtime.statusEnum().isTerminal()) {
         return;
       }
-      runtime.destroyProcessForcibly();
+      ManagedWorkerProcess terminatedProc = runtime.invalidateRunGenerationAndDestroyProcessLocked();
       Integer forcedExit = null;
-      if (!process.isAlive()) {
+      if (terminatedProc != null && !terminatedProc.isAlive()) {
         try {
-          forcedExit = process.exitValue();
+          forcedExit = terminatedProc.exitValue();
         } catch (IllegalThreadStateException ignored) {
           // Process still terminating in OS.
         }
@@ -882,22 +947,22 @@ public class TrainingJobService {
     launchPromotedRuntimes(promoted);
   }
 
-  private void readWorkerOutput(ManagedJobRuntime runtime, ManagedWorkerProcess process) {
+  private void readWorkerOutput(ManagedJobRuntime runtime, ManagedWorkerProcess process, long runGeneration) {
     try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.outputStream(), StandardCharsets.UTF_8))) {
       String line;
       while ((line = reader.readLine()) != null) {
-        if (shuttingDown || !runtime.isCurrentProcessOrTerminated(process)) {
+        if (shuttingDown || !runtime.isActiveRunGeneration(runGeneration)) {
           return;
         }
-        handleWorkerLine(runtime, line.trim());
+        handleWorkerLine(runtime, runGeneration, line.trim());
       }
     } catch (IOException ignored) {
       // Process exit handler reconciles final state and slot cleanup.
     }
   }
 
-  private void handleWorkerLine(ManagedJobRuntime runtime, String line) {
-    if (line.isBlank() || !line.startsWith("{")) {
+  private void handleWorkerLine(ManagedJobRuntime runtime, long runGeneration, String line) {
+    if (line.isBlank() || !line.startsWith("{") || !runtime.isActiveRunGeneration(runGeneration)) {
       return;
     }
     JsonNode node;
@@ -913,7 +978,7 @@ public class TrainingJobService {
     String type = eventNode.path("type").asText("");
     String reportedDevice = eventNode.path("device").asText(null);
     if (reportedDevice != null && !reportedDevice.isBlank()) {
-      runtime.updateDevice(reportedDevice.trim());
+      runtime.updateDevice(runGeneration, reportedDevice.trim());
     }
 
     if ("metric".equals(type)) {
@@ -921,6 +986,9 @@ public class TrainingJobService {
         TrainingMetricMessage metric = objectMapper.treeToValue(eventNode, TrainingMetricMessage.class);
         String rawJson;
         synchronized (schedulerLock) {
+          if (!runtime.isActiveRunGeneration(runGeneration)) {
+            return;
+          }
           runtime.updateMetrics(metric);
           rawJson = recordRuntimeEventLocked(runtime, eventNode, Instant.now());
         }
@@ -930,9 +998,14 @@ public class TrainingJobService {
       }
     } else if ("control".equals(type)) {
       String workerStatus = eventNode.path("status").asText("");
-      handleWorkerControlEventAndBroadcast(runtime, workerStatus, eventNode);
+      handleWorkerControlEventAndBroadcast(runtime, runGeneration, workerStatus, eventNode);
     } else if ("test_result".equals(type)) {
-      runtime.setTestResult(eventNode);
+      synchronized (schedulerLock) {
+        if (!runtime.isActiveRunGeneration(runGeneration)) {
+          return;
+        }
+        runtime.setTestResult(eventNode);
+      }
       if (!runtime.checkpointSaved() && runtime.owner() != null && !runtime.owner().isBlank()) {
         try {
           saveCheckpoint(runtime, eventNode);
@@ -941,25 +1014,34 @@ public class TrainingJobService {
           // Keep streaming the test result even if persistence fails.
         }
       }
-      appendAndBroadcastEvent(runtime, eventNode);
+      appendAndBroadcastWorkerEvent(runtime, runGeneration, eventNode);
     } else if ("backprop".equals(type)) {
-      appendAndBroadcastEvent(runtime, eventNode);
+      appendAndBroadcastWorkerEvent(runtime, runGeneration, eventNode);
     } else if ("error".equals(type)) {
       String errorCode = eventNode.path("errorCode").asText("WORKER_RUNTIME_ERROR");
       String message = eventNode.path("message").asText("Python training worker failed.");
-      runtime.recordWorkerError(errorCode, message);
-      appendAndBroadcastEvent(runtime, eventNode);
+      synchronized (schedulerLock) {
+        if (!runtime.isActiveRunGeneration(runGeneration)) {
+          return;
+        }
+        runtime.recordWorkerError(errorCode, message);
+      }
+      appendAndBroadcastWorkerEvent(runtime, runGeneration, eventNode);
     }
   }
 
   private void handleWorkerControlEventAndBroadcast(
       ManagedJobRuntime runtime,
+      long runGeneration,
       String workerStatus,
       ObjectNode eventNode
   ) {
-    List<ManagedJobRuntime> promoted = new ArrayList<>();
+    List<ScheduledLaunch> promoted = new ArrayList<>();
     String rawJson;
     synchronized (schedulerLock) {
+      if (!runtime.isActiveRunGeneration(runGeneration)) {
+        return;
+      }
       TrainingJobStatus current = runtime.statusEnum();
       if (!current.isTerminal() && workerStatus != null && !workerStatus.isBlank()) {
         switch (workerStatus) {
@@ -985,14 +1067,14 @@ public class TrainingJobService {
             if (TrainingJobStateMachine.canTransition(current, TrainingJobStatus.COMPLETED)) {
               transitionJobLocked(runtime, TrainingJobStatus.COMPLETED, 0, null, null);
               releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
-              scheduleTerminalProcessReaper(runtime, runtime.process());
+              scheduleTerminalProcessReaper(runtime, runGeneration, runtime.process());
             }
           }
           case "stopped" -> {
             if (TrainingJobStateMachine.canTransition(current, TrainingJobStatus.STOPPED)) {
               transitionJobLocked(runtime, TrainingJobStatus.STOPPED, 0, null, null);
               releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
-              scheduleTerminalProcessReaper(runtime, runtime.process());
+              scheduleTerminalProcessReaper(runtime, runGeneration, runtime.process());
             }
           }
           default -> {
@@ -1006,7 +1088,11 @@ public class TrainingJobService {
     launchPromotedRuntimes(promoted);
   }
 
-  private void scheduleTerminalProcessReaper(ManagedJobRuntime runtime, ManagedWorkerProcess process) {
+  private void scheduleTerminalProcessReaper(
+      ManagedJobRuntime runtime,
+      long runGeneration,
+      ManagedWorkerProcess process
+  ) {
     if (process == null || !process.isAlive()) {
       return;
     }
@@ -1014,7 +1100,11 @@ public class TrainingJobService {
     timerExecutor.schedule(() -> {
       if (!shuttingDown && process.isAlive()) {
         process.destroyForcibly();
-        runtime.clearProcessReference(process);
+      }
+      synchronized (schedulerLock) {
+        if (runtime.isActiveRunGeneration(runGeneration)) {
+          runtime.clearProcessReference(process);
+        }
       }
     }, delayMs, TimeUnit.MILLISECONDS);
   }
@@ -1022,11 +1112,14 @@ public class TrainingJobService {
   private void waitForWorkerExit(
       ManagedJobRuntime runtime,
       ManagedWorkerProcess process,
+      long runGeneration,
       Future<?> outputReaderFuture
   ) {
     try {
       int exitCode = process.waitFor();
-      process.destroyForcibly();
+      if (process.isAlive()) {
+        process.destroyForcibly();
+      }
       if (outputReaderFuture != null) {
         try {
           outputReaderFuture.get(2, TimeUnit.SECONDS);
@@ -1034,16 +1127,16 @@ public class TrainingJobService {
           // Best-effort wait to drain trailing stdout lines before final state reconciliation.
         }
       }
-      if (shuttingDown) {
+      if (shuttingDown || !runtime.isActiveRunGeneration(runGeneration)) {
         return;
       }
-      List<ManagedJobRuntime> promoted = new ArrayList<>();
+      List<ScheduledLaunch> promoted = new ArrayList<>();
       String syntheticControlStatus = null;
       String syntheticControlMessage = null;
       String syntheticErrorCode = null;
       String syntheticErrorReason = null;
       synchronized (schedulerLock) {
-        if (!runtime.isCurrentProcessOrTerminated(process)) {
+        if (!runtime.isActiveRunGeneration(runGeneration)) {
           return;
         }
         runtime.clearProcessReference(process);
@@ -1054,7 +1147,9 @@ public class TrainingJobService {
             runtime.entity().setUpdatedAt(Instant.now());
             jobRepository.saveAndFlush(runtime.entity());
           }
-          releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
+          if (activeSlotJobIds.contains(runtime.jobId())) {
+            releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
+          }
         } else if (exitCode == 0 && runtime.pendingControlEnum() == TrainingControlAction.STOP) {
           transitionJobLocked(runtime, TrainingJobStatus.STOPPED, 0, null, null);
           syntheticControlStatus = TrainingJobStatus.STOPPED.wireValue();
@@ -1134,7 +1229,7 @@ public class TrainingJobService {
     jobRepository.saveAndFlush(entity);
   }
 
-  private void releaseSlotAndCollectNextLocked(String finishedJobId, List<ManagedJobRuntime> promotedOut) {
+  private void releaseSlotAndCollectNextLocked(String finishedJobId, List<ScheduledLaunch> promotedOut) {
     activeSlotJobIds.remove(finishedJobId);
     while (activeSlotJobIds.size() < properties.getMaxConcurrentJobs() && !waitQueue.isEmpty()) {
       String nextJobId = waitQueue.pollFirst();
@@ -1152,12 +1247,12 @@ public class TrainingJobService {
       candidate.entity().setUpdatedAt(now);
       jobRepository.saveAndFlush(candidate.entity());
       activeSlotJobIds.add(nextJobId);
-      promotedOut.add(candidate);
+      promotedOut.add(new ScheduledLaunch(candidate, candidate.allocateRunGenerationLocked()));
     }
   }
 
-  private void launchPromotedRuntimes(List<ManagedJobRuntime> promoted) {
-    for (ManagedJobRuntime next : promoted) {
+  private void launchPromotedRuntimes(List<ScheduledLaunch> promoted) {
+    for (ScheduledLaunch next : promoted) {
       launchWorkerForSlotOwner(next, false);
     }
   }
@@ -1176,6 +1271,17 @@ public class TrainingJobService {
     node.put("errorCode", errorCode);
     node.put("message", message);
     appendAndBroadcastEvent(runtime, node);
+  }
+
+  private void appendAndBroadcastWorkerEvent(ManagedJobRuntime runtime, long runGeneration, ObjectNode eventNode) {
+    String rawJson;
+    synchronized (schedulerLock) {
+      if (!runtime.isActiveRunGeneration(runGeneration)) {
+        return;
+      }
+      rawJson = recordRuntimeEventLocked(runtime, eventNode, Instant.now());
+    }
+    broadcastRaw(runtime.jobId(), rawJson);
   }
 
   private void appendAndBroadcastEvent(ManagedJobRuntime runtime, ObjectNode eventNode) {
@@ -1584,6 +1690,17 @@ public class TrainingJobService {
     }
   }
 
+  private StartTrainingRequest deserializeRequest(String rawJson) {
+    if (rawJson == null || rawJson.isBlank()) {
+      throw new IllegalArgumentException("Original training request payload is unavailable for reset.");
+    }
+    try {
+      return objectMapper.readValue(rawJson, StartTrainingRequest.class);
+    } catch (JsonProcessingException ex) {
+      throw new IllegalArgumentException("Failed to deserialize original training request for reset.");
+    }
+  }
+
   private String computeConfigDigest(StartTrainingRequest request) {
     ObjectNode root = objectMapper.createObjectNode();
     root.put("datasetId", request.datasetId());
@@ -1749,6 +1866,8 @@ public class TrainingJobService {
 
   private record SequencedEventRecord(long sequence, JsonNode payload, String rawJson) {}
 
+  private record ScheduledLaunch(ManagedJobRuntime runtime, long runGeneration) {}
+
   private final class ManagedJobRuntime {
     private final TrainingJob entity;
     private final StartTrainingRequest request;
@@ -1756,6 +1875,7 @@ public class TrainingJobService {
     private final Path requestFile;
     private final Path controlFile;
     private final Path checkpointFile;
+    private volatile long runGeneration = 0L;
     private volatile TrainingMetricMessage latestMetric;
     private volatile JsonNode testResult;
     private volatile boolean checkpointSaved;
@@ -1811,8 +1931,11 @@ public class TrainingJobService {
       entity.setUpdatedAt(Instant.now());
     }
 
-    private void updateDevice(String device) {
+    private void updateDevice(long expectedGeneration, String device) {
       synchronized (schedulerLock) {
+        if (!isActiveRunGeneration(expectedGeneration)) {
+          return;
+        }
         if (!Objects.equals(entity.getDevice(), device)) {
           entity.setDevice(device);
           entity.setUpdatedAt(Instant.now());
@@ -1824,34 +1947,6 @@ public class TrainingJobService {
     private void recordWorkerError(String errorCode, String message) {
       this.lastWorkerErrorCode = errorCode;
       this.lastWorkerErrorMessage = message;
-    }
-
-    private void resetForRerun(TrainingJobStatus status, Instant startedAt) {
-      cancelTimers();
-      latestMetric = null;
-      testResult = null;
-      checkpointSaved = false;
-      lastWorkerErrorCode = null;
-      lastWorkerErrorMessage = null;
-      synchronized (recentEvents) {
-        recentEvents.clear();
-      }
-      synchronized (metricHistory) {
-        metricHistory.clear();
-      }
-      Instant now = Instant.now();
-      entity.setStatus(status.wireValue());
-      entity.setPendingControl(null);
-      entity.setStartedAt(startedAt);
-      entity.setFinishedAt(null);
-      entity.setUpdatedAt(now);
-      entity.setExitCode(null);
-      entity.setErrorCode(null);
-      entity.setErrorReason(null);
-      entity.setEpoch(0);
-      entity.setBatch(0);
-      entity.setElapsedSeconds(0L);
-      entity.setEtaSeconds(0L);
     }
 
     private void addSequencedEvent(SequencedEventRecord record) {
@@ -1911,13 +2006,34 @@ public class TrainingJobService {
       }
     }
 
-    private void destroyProcessForcibly() {
+    private long allocateRunGenerationLocked() {
+      runGeneration += 1L;
+      return runGeneration;
+    }
+
+    private long currentRunGenerationLocked() {
+      return runGeneration;
+    }
+
+    private boolean isActiveRunGeneration(long expectedGeneration) {
+      return expectedGeneration > 0L && runGeneration == expectedGeneration;
+    }
+
+    private void attachProcessLocked(long expectedGeneration, ManagedWorkerProcess nextProcess) {
+      if (isActiveRunGeneration(expectedGeneration)) {
+        this.process = nextProcess;
+      }
+    }
+
+    private ManagedWorkerProcess invalidateRunGenerationAndDestroyProcessLocked() {
+      runGeneration += 1L;
       cancelTimers();
       ManagedWorkerProcess current = process;
       process = null;
       if (current != null) {
         current.destroyForcibly();
       }
+      return current;
     }
 
     private void cancelTimers() {
@@ -1931,14 +2047,6 @@ public class TrainingJobService {
       if (sf != null) {
         sf.cancel(false);
       }
-    }
-
-    private boolean isCurrentProcess(ManagedWorkerProcess candidate) {
-      return process == candidate;
-    }
-
-    private boolean isCurrentProcessOrTerminated(ManagedWorkerProcess candidate) {
-      return process == candidate || process == null;
     }
 
     private void clearProcessReference(ManagedWorkerProcess candidate) {
@@ -1970,8 +2078,13 @@ public class TrainingJobService {
     private Path controlFile() { return controlFile; }
     private Path checkpointFile() { return checkpointFile; }
     private ManagedWorkerProcess process() { return process; }
-    private void setProcess(ManagedWorkerProcess process) { this.process = process; }
-    private void setJobTimeoutFuture(ScheduledFuture<?> future) { this.jobTimeoutFuture = future; }
+    private void setJobTimeoutFuture(ScheduledFuture<?> future) {
+      ScheduledFuture<?> prev = this.jobTimeoutFuture;
+      this.jobTimeoutFuture = future;
+      if (prev != null) {
+        prev.cancel(false);
+      }
+    }
     private void setStopTimeoutFuture(ScheduledFuture<?> future) {
       ScheduledFuture<?> prev = this.stopTimeoutFuture;
       this.stopTimeoutFuture = future;
