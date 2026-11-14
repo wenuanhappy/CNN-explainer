@@ -2,6 +2,9 @@ package com.deepvision.studio.training;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import com.deepvision.studio.auth.AppUserRepository;
 import com.deepvision.studio.training.TrainingDtos.StartTrainingRequest;
@@ -16,6 +19,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -155,5 +159,53 @@ class TrainingIdempotencyTest {
     assertThat(bobFirst.jobId()).isNotEqualTo(aliceFirst.jobId());
     assertThat(jobRepository.count()).isEqualTo(2);
     assertThat(launcher.totalLaunches()).isEqualTo(2);
+  }
+
+  @Test
+  void idempotentReplaySucceedsBeforeDatasetLookupEvenAfterDatasetDeleted() {
+    TrainingProperties props = new TrainingProperties();
+    props.setJobsRoot(tempDir.resolve("jobs-idem-deleted-ds").toString());
+    props.setMaxConcurrentJobs(1);
+    props.setMaxActiveJobsPerUser(2);
+    props.setMaxQueueSize(2);
+
+    AtomicBoolean datasetDeleted = new AtomicBoolean(false);
+    TrainingDatasetService datasetService = mock(TrainingDatasetService.class);
+    when(datasetService.getDetail(anyString(), anyString())).thenAnswer(invocation -> {
+      if (datasetDeleted.get()) {
+        throw new IllegalArgumentException("Dataset not found: " + invocation.getArgument(0));
+      }
+      return TrainingTestFixtures.sampleDataset(invocation.getArgument(0));
+    });
+
+    ControllableTrainingProcessLauncher launcher = new ControllableTrainingProcessLauncher();
+    activeService = new TrainingJobService(
+        datasetService,
+        userRepository,
+        checkpointRepository,
+        jobRepository,
+        (req, ds) -> {},
+        launcher,
+        props,
+        new ObjectMapper(),
+        tempDir.resolve("datasets").toString()
+    );
+
+    StartTrainingRequest req = TrainingTestFixtures.sampleStartRequest("custom-ds-1", 32, 10);
+    TrainingStartResponse first = activeService.start(req, "alice", "idem-after-delete");
+    assertThat(first.idempotentReplay()).isFalse();
+
+    // Simulate dataset deletion before client retries the same Idempotency-Key
+    datasetDeleted.set(true);
+
+    TrainingStartResponse replay = activeService.start(req, "alice", "idem-after-delete");
+    assertThat(replay.jobId()).isEqualTo(first.jobId());
+    assertThat(replay.idempotentReplay()).isTrue();
+    assertThat(launcher.totalLaunches()).isEqualTo(1);
+
+    // Without Idempotency-Key (new submission), deleted dataset still fails validation as expected
+    assertThatThrownBy(() -> activeService.start(req, "alice", null))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Dataset not found");
   }
 }

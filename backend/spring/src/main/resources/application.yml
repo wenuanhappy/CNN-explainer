@@ -44,6 +44,7 @@ deepvision:
     max-queue-size: ${DEEPVISION_TRAINING_MAX_QUEUE_SIZE:4}
     job-timeout: ${DEEPVISION_TRAINING_JOB_TIMEOUT:30m}
     stop-timeout: ${DEEPVISION_TRAINING_STOP_TIMEOUT:10s}
+    terminal-runtime-retention: ${DEEPVISION_TRAINING_TERMINAL_RUNTIME_RETENTION:10m}
     max-history-events: ${DEEPVISION_TRAINING_MAX_HISTORY_EVENTS:240}
     release-slot-on-pause: ${DEEPVISION_TRAINING_RELEASE_SLOT_ON_PAUSE:false}
   llm:

@@ -3,14 +3,20 @@ package com.deepvision.studio.training;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.deepvision.studio.auth.AppUser;
 import com.deepvision.studio.auth.AppUserRepository;
 import com.deepvision.studio.training.ControllableTrainingProcessLauncher.FakeWorkerProcess;
 import com.deepvision.studio.training.TrainingDtos.TrainingControlResponse;
+import com.deepvision.studio.training.TrainingDtos.TrainingEventsResponse;
 import com.deepvision.studio.training.TrainingDtos.TrainingStartResponse;
 import com.deepvision.studio.training.TrainingDtos.TrainingStatusResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -34,6 +40,9 @@ class TrainingControlConfirmationTest {
   @Autowired
   private TrainingCheckpointRepository checkpointRepository;
 
+  @Autowired
+  private TrainingJobEventRepository eventRepository;
+
   @TempDir
   Path tempDir;
 
@@ -44,6 +53,7 @@ class TrainingControlConfirmationTest {
     if (activeService != null) {
       activeService.shutdown();
     }
+    eventRepository.deleteAll();
     checkpointRepository.deleteAll();
     jobRepository.deleteAll();
     userRepository.deleteAll();
@@ -273,5 +283,79 @@ class TrainingControlConfirmationTest {
             && activeService.activeManagedProcessCount() == 0,
         "Expected aliceJob to complete and release slot"
     );
+  }
+
+  @Test
+  void workerControlStoppedRecordsRealProcessExitCodeAndEvictsTerminalRuntimeAfterRetention() throws Exception {
+    userRepository.saveAndFlush(new AppUser("alice", "hash-a", "Alice"));
+
+    TrainingProperties props = new TrainingProperties();
+    props.setJobsRoot(tempDir.resolve("jobs-exit-and-evict").toString());
+    props.setMaxConcurrentJobs(1);
+    props.setMaxQueueSize(2);
+    props.setMaxActiveJobsPerUser(4);
+    props.setTerminalRuntimeRetention(Duration.ofMillis(75));
+
+    ControllableTrainingProcessLauncher launcher = new ControllableTrainingProcessLauncher();
+    activeService = new TrainingJobService(
+        TrainingTestFixtures.mockDatasetService(),
+        userRepository,
+        checkpointRepository,
+        jobRepository,
+        eventRepository,
+        (req, ds) -> {},
+        launcher,
+        props,
+        new ObjectMapper(),
+        tempDir.resolve("datasets").toString()
+    );
+
+    TrainingStartResponse job = activeService.start(TrainingTestFixtures.sampleStartRequest(32, 4), "alice");
+    FakeWorkerProcess worker = launcher.awaitProcess(job.jobId(), Duration.ofSeconds(2));
+    assertThat(activeService.runtimeCountForTest()).isEqualTo(1);
+
+    // Write checkpoint file and emit test_result so auto-checkpoint persists in H2 before stop
+    Files.createDirectories(worker.request().checkpointFile().getParent());
+    Files.writeString(worker.request().checkpointFile(), "mock-weights", StandardCharsets.UTF_8);
+    worker.emitJson(Map.of(
+        "type", "test_result",
+        "jobId", job.jobId(),
+        "testLoss", 0.25,
+        "testAccuracy", 0.91,
+        "sampleCount", 18,
+        "samples", List.of()
+    ));
+
+    activeService.stop("alice", job.jobId());
+    // Worker emits 'stopped' control event, then exits with non-zero OS exit code 2
+    worker.emitControl("stopped", "Stopped on user request.");
+    worker.finish(2);
+
+    TrainingTestFixtures.awaitUntil(
+        Duration.ofSeconds(2),
+        () -> "stopped".equals(activeService.status("alice", job.jobId()).status())
+            && Integer.valueOf(2).equals(activeService.status("alice", job.jobId()).exitCode()),
+        "Expected real OS process exit code 2 to be recorded after worker exit"
+    );
+    assertThat(activeService.status("alice", job.jobId()).exitCode()).isEqualTo(2);
+
+    // Wait for terminalRuntimeRetention (75ms) to evict ManagedJobRuntime from memory
+    TrainingTestFixtures.awaitUntil(
+        Duration.ofSeconds(2),
+        () -> activeService.runtimeCountForTest() == 0,
+        "Expected terminal ManagedJobRuntime to be evicted after retention delay"
+    );
+
+    // Queries and idempotent save continue working seamlessly from H2 after memory eviction
+    TrainingStatusResponse dbStatus = activeService.status("alice", job.jobId());
+    assertThat(dbStatus.status()).isEqualTo("stopped");
+    assertThat(dbStatus.exitCode()).isEqualTo(2);
+
+    TrainingEventsResponse dbEvents = activeService.events("alice", job.jobId(), 0L, 20);
+    assertThat(dbEvents.events()).hasSize(2);
+
+    TrainingControlResponse savedAfterEviction = activeService.save("alice", job.jobId());
+    assertThat(savedAfterEviction.accepted()).isTrue();
+    assertThat(savedAfterEviction.message()).contains("Checkpoint saved:");
   }
 }

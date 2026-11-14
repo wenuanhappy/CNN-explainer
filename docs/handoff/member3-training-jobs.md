@@ -33,9 +33,9 @@
 | B3 | 交接文档与 PR 描述补充成员4前端适配清单（合并前置条件） | 未开始 | | |
 | S1 | 接入 `release-slot-on-pause` 配置（暂停释放槽位、恢复重申槽位/排队） | 完成 | `32254a7` | 接入 `TrainingJobStateMachine.occupiesExecutionSlot`：`true` 时确认暂停后释放槽位并晋升排队任务，`resume` 时重申槽位（无空闲槽位返 429 `TRAINING_CAPACITY_EXCEEDED` / `resume_slot_unavailable`） |
 | S2 | `jobTimeout` 仅累计实际运行时间（暂停停止计时、恢复续计） | 完成 | `a396323` | 基于单调时钟 `System.nanoTime()` 记录 `remainingJobTimeoutNanos`，`paused` 确认时扣减已运行耗时并取消定时器，`running` 恢复确认后按剩余额度重新计时 |
-| S3 | 事件持久化减少锁内 DB 写入与按间隔批量裁剪历史事件 | 完成 | 本次提交 | 在 `schedulerLock` 内仅分配单调 `sequence` 与更新内存环形缓冲，`TrainingJobEvent` 插入与批量裁剪移至单任务 `persistenceLock` 锁外执行；流式事件每 16 条才 flush 一次 `TrainingJob`，历史表按溢出阈值 16 条（及终态/按需读取时）批量裁剪 |
+| S3 | 事件持久化减少锁内 DB 写入与按间隔批量裁剪历史事件 | 完成 | `ff3fafd` | 在 `schedulerLock` 内仅分配单调 `sequence` 与更新内存环形缓冲，`TrainingJobEvent` 插入与批量裁剪移至单任务 `persistenceLock` 锁外执行；流式事件每 16 条才 flush 一次 `TrainingJob`，历史表按溢出阈值 16 条（及终态/按需读取时）批量裁剪 |
 | S4 | 恢复 `TrainingJobService.java` 与 `application.yml` 的 `i/crlf` 换行符 | 完成 | `b4b8790` | 消除约 1490 行纯换行符虚增 diff |
-| 次要项 | 启动恢复单次执行、真实 `exitCode` 回写、终态内存清理、幂等前置校验、Python 路径冲突提示 | 未开始 | | |
+| 次要项 | 启动恢复单次执行、真实 `exitCode` 回写、终态内存清理、幂等前置校验、Python 路径冲突提示 | 完成 | 本次提交 | 移除重复 `@PostConstruct`；`completed/stopped` 确认不再硬编码 `0`，在 `waitForWorkerExit` 写入真实 OS `exitCode`；终态延迟 `terminal-runtime-retention`（默认 `10m`）移除内存 `ManagedJobRuntime` 并全路径回退 H2；幂等查找前置到 `datasetService.getDetail` 之前；补充成员1 `T1-03` Python 路径合并冲突说明 |
 
 ## 现状核查（已复核，基于 main @ 32a7d80）
 
@@ -50,6 +50,7 @@
 
 ## 协作边界
 
+- 成员1：运行环境与统一配置（含 `T1-03`）。注意本分支在 `backend/spring/src/main/resources/application.yml` 中将 `deepvision.training.python-executable` 硬编码个人路径改为了 `${DEEPVISION_TRAINING_PYTHON:python}`，与成员1的 `T1-03` 修改位置重叠，合并 PR 时请注意解决冲突并以统一的环境变量配置为准（切勿回退为个人绝对路径）。
 - 成员2：网络校验、模型构建、协议解析（包括 `training_worker.py` 的模型与协议部分、`TrainingDtos.java` 的网络字段）。本分支只在创建进程前预留 `NetworkValidator` 校验接口，不修改模型构建与协议解析代码。
 - 成员4：前端 `frontend/`。本分支不改前端；响应和事件只新增字段，不删除也不重命名已有字段。
 - 成员5：测试基础设施与 CI。本分支在 `backend/spring/pom.xml` 中加入了 `<scope>test</scope>` 的 `spring-boot-starter-test`，并新增 `src/test/resources/application-test.yml`（内存 H2 + 临时目录隔离），供成员5统一纳管。
@@ -71,6 +72,11 @@
    - **超时语义**：`deepvision.training.job-timeout`（`DEEPVISION_TRAINING_JOB_TIMEOUT`）改为**仅累计任务处于 `running` 状态的活跃运行时间**，不计入 `queued` 排队时间与 `paused` 暂停时间。worker 确认 `paused` 时使用 `System.nanoTime()` 扣减本段已运行时间并取消超时定时器；确认恢复 `running` 后按剩余预算重新挂载定时器。
    - **30m 默认值对 CPU 训练的合理性评估**：本项目面向 CNN 教学可视化，内置数据集（`points-2d`、表格 CSV、MNIST 子集约 1k～2k 张 `28x28`、CIFAR-10 子集约 2k～5k 张 `32x32`）及受上传大小上限约束的自定义数据集在主流 4～8 核教学笔记本纯 CPU 环境下，常规 2～3 层卷积 / 20～50 epoch 训练耗时约 5 秒～4 分钟，较深 6 层自定义网络 100 epoch 约 8～15 分钟。在排除课堂演示暂停观察时间后，`30m` 活跃运行上限既为纯 CPU 正常训练留出 2～6 倍安全余量，又能及时回收死循环或卡死进程；超大自定义数据集可通过 `DEEPVISION_TRAINING_JOB_TIMEOUT` 覆盖（如 `60m`）。
 10. **2026-11-14（S3 事件锁外持久化、低频实体 flush 与批量历史裁剪）**：将事件处理拆分为两阶段——在全局 `schedulerLock` 内仅原子递增 `TrainingJob.lastSequence`、追加内存环形缓冲，且高频流式事件（`metric`/`backprop`）每累计 `ENTITY_FLUSH_EVENT_INTERVAL = 16` 条才执行一次 `jobRepository.saveAndFlush`（控制/错误/`test_result`/终态事件仍立即 flush）；而 `eventRepository.save` 与历史窗口裁剪全部移出 `schedulerLock`，在单任务 `runtime.persistenceLock` 下执行，并仅当未裁剪溢出达到 `EVENT_PRUNE_BATCH_SIZE = 16` 或进入终态时批量执行 `deleteByJobIdAndSequenceLessThanEqual`。调用 `GET /api/training/{jobId}/events` 时通过 `awaitPendingEventWrites()` 等待在途落盘并按需裁剪精确窗口，既保证 `sequence` 严格单调与读写一致性，又将流式事件在全局锁内的 DB 写入从每条 3 次降至平均 1/16 次。
+11. **2026-11-14（次要评审项收敛）**：
+    - 移除 `recoverOrphanedJobsOnStartup()` 上的 `@PostConstruct`，仅保留构造函数单次调用；
+    - 收到 worker 的 `completed`/`stopped` 控制事件时不再将 `exitCode` 硬编码为 `0`，而是留空（`null`），待 `waitForWorkerExit` 中 `process.waitFor()` 返回后如实写入子进程真实退出码；
+    - 新增 `deepvision.training.terminal-runtime-retention`（默认 `10m`），任务进入终态且进程退出后延迟驱逐 `runtimes` 中的 `ManagedJobRuntime`（以及已关闭的 WebSocket 会话集合），驱逐后 `status`、`events`、`reset`、`save`（读取已自动落库的 `TrainingCheckpoint`）与 WebSocket 历史重放全部无缝走 H2 数据库；
+    - 将 `start()` 的幂等键查找提前至 `datasetService.getDetail()` 与 `networkValidator.validate()` 之前（同时保留锁内二次校验防并发竞态），保证数据集被删除后客户端使用相同 `Idempotency-Key` 重试仍能幂等返回原任务而非 400。
 
 ## 接口与协议变更（给成员2/4/5）
 
@@ -93,6 +99,7 @@
   - `max-queue-size`: `4`（`DEEPVISION_TRAINING_MAX_QUEUE_SIZE`）
   - `job-timeout`: `30m`（`DEEPVISION_TRAINING_JOB_TIMEOUT`，仅累计 `running` 状态活跃运行时间，`paused` 期间暂停计时）
   - `stop-timeout`: `10s`（`DEEPVISION_TRAINING_STOP_TIMEOUT`）
+  - `terminal-runtime-retention`: `10m`（`DEEPVISION_TRAINING_TERMINAL_RUNTIME_RETENTION`，终态任务在内存中保留的时长，到期后自动释放并改走数据库查询）
   - `max-history-events`: `240`（`DEEPVISION_TRAINING_MAX_HISTORY_EVENTS`）
   - `release-slot-on-pause`: `false`（`DEEPVISION_TRAINING_RELEASE_SLOT_ON_PAUSE`）
 
@@ -161,6 +168,7 @@
 - 错误结构 `{ code, message, details, requestId }` 和 `schemaVersion`（暂定 `"1.0"`）规则为训练模块临时约定，需要与成员2最终对齐。
 - 新增的状态值（`queued`、`failed`、`interrupted`）及 `pendingControl` 字段需要与成员4确认前端展示方式。
 - `pom.xml` 加入 `spring-boot-starter-test` 及 `application-test.yml` 的方式需要与成员5统一纳管。
+- `backend/spring/src/main/resources/application.yml` 中 `deepvision.training.python-executable` 的环境变量化修改与成员1的 `T1-03` 重叠，合并 PR 时需注意解决该行冲突。
 - 当前开发机全局 PATH 中未预装 `mvn` 与 `gh`，测试通过本地 JDK (`D:\Android\jbr`) + 临时目录 Apache Maven 3.9.9 与 Python 3.12 (`D:\Python`) 虚拟环境执行。
 
 ## 下一步（按优先级，下一个 agent 从这里开始）
@@ -196,4 +204,5 @@
 - 2026-11-14 16:35（member3-followup-agent）：完成 B2（`launchWorkerForSlotOwner()` 捕获 `IOException | RuntimeException`，确保任意启动异常均标记 `failed`/`WORKER_START_FAILED`、发出合成 `error` 事件、释放槽位并晋升下一排队任务，在 `TrainingFailureAndRecoveryTest` 新增回归测试），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（23 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过），提交 `2c04439`。
 - 2026-11-14 16:38（member3-followup-agent）：完成 S1（接入 `deepvision.training.release-slot-on-pause`，支持暂停确认释放槽位晋升排队任务、恢复时重申槽位及无槽位 429 错误，在 `TrainingControlConfirmationTest` 补充单测），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（24 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过），提交 `32254a7`。
 - 2026-11-14 16:40（member3-followup-agent）：完成 S2（将 `jobTimeout` 改为基于单调时钟仅累计 `running` 活跃耗时、`paused` 停止计时并在文档中评估 30m CPU 默认值合理性，在 `TrainingFailureAndRecoveryTest` 补充暂停跨超时单测），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（25 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过），提交 `a396323`。
-- 2026-11-14 16:50（member3-followup-agent）：完成 S3（将 `TrainingJobEvent` 写入与裁剪移出全局 `schedulerLock`、流式事件每 16 条批量 flush `TrainingJob`、历史事件按阈值 16 批量裁剪并在读取/终态兜底对齐窗口，在 `TrainingEventStreamAndHistoryTest` 补充批量裁剪单测），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（26 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过）。
+- 2026-11-14 16:50（member3-followup-agent）：完成 S3（将 `TrainingJobEvent` 写入与裁剪移出全局 `schedulerLock`、流式事件每 16 条批量 flush `TrainingJob`、历史事件按阈值 16 批量裁剪并在读取/终态兜底对齐窗口，在 `TrainingEventStreamAndHistoryTest` 补充批量裁剪单测），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（26 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过），提交 `ff3fafd`。
+- 2026-11-14 16:57（member3-followup-agent）：完成 5 项次要评审项（移除重复 `@PostConstruct`、在 `waitForWorkerExit` 写入真实 OS `exitCode`、新增 `terminal-runtime-retention` 延迟驱逐终态内存对象并回退 H2、将幂等查找前置到 `datasetService.getDetail` 之前、补充成员1 `T1-03` Python 路径冲突提示，并在 `TrainingControlConfirmationTest` 与 `TrainingIdempotencyTest` 新增单测），执行 `JAVA_HOME=D:\Android\jbr mvn -o "-Dmaven.repo.local=.m2/repository" "-DforkCount=0" -q clean test`（28 项通过）与 `.venv\Scripts\python.exe -m pytest tests -q`（7 项通过）。

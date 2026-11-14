@@ -192,7 +192,9 @@ class TrainingEndToEndIntegrationTest {
     TrainingTestFixtures.awaitUntil(
         Duration.ofSeconds(8),
         () -> "stopped".equals(jobService.status("e2e_alice", job1Id).status())
-            && "completed".equals(jobService.status("e2e_alice", job2Id).status()),
+            && jobService.status("e2e_alice", job1Id).exitCode() != null
+            && "completed".equals(jobService.status("e2e_alice", job2Id).status())
+            && jobService.status("e2e_alice", job2Id).exitCode() != null,
         "Expected job1 to stop and promoted job2 to complete end-to-end"
     );
 

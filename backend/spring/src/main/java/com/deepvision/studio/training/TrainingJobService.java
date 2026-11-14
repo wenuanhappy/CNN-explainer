@@ -25,7 +25,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -155,7 +154,6 @@ public class TrainingJobService {
     recoverOrphanedJobsOnStartup();
   }
 
-  @PostConstruct
   int recoverOrphanedJobsOnStartup() {
     int recovered = 0;
     synchronized (schedulerLock) {
@@ -204,6 +202,17 @@ public class TrainingJobService {
   public TrainingStartResponse start(StartTrainingRequest request, String username, String idempotencyKey) {
     requireUser(username);
     String normalizedKey = normalizeIdempotencyKey(idempotencyKey);
+    String configDigest = computeConfigDigest(request);
+    if (normalizedKey != null) {
+      synchronized (schedulerLock) {
+        TrainingStartResponse earlyReplay =
+            findIdempotentReplayOrThrowConflictLocked(username, normalizedKey, configDigest);
+        if (earlyReplay != null) {
+          return earlyReplay;
+        }
+      }
+    }
+
     TrainingDatasetDetail dataset = datasetService.getDetail(request.datasetId(), username);
     validateSplit(request.split());
     if (!dataset.hasLabels()) {
@@ -217,7 +226,6 @@ public class TrainingJobService {
     double trainSamples = Math.max(1, dataset.sampleCount() * request.split().train());
     int totalBatches = Math.max(1, (int) Math.ceil(trainSamples / batchSize));
     String modelSig = modelSignature(request);
-    String configDigest = computeConfigDigest(request);
     String requestJson = serializeRequest(request);
 
     ScheduledLaunch scheduledLaunch = null;
@@ -228,33 +236,10 @@ public class TrainingJobService {
 
     synchronized (schedulerLock) {
       if (normalizedKey != null) {
-        TrainingJob existing = jobRepository.findByOwnerAndIdempotencyKey(username, normalizedKey).orElse(null);
-        if (existing != null) {
-          if (!Objects.equals(existing.getConfigDigest(), configDigest)) {
-            Map<String, Object> details = new LinkedHashMap<>();
-            details.put("jobId", existing.getJobId());
-            details.put("idempotencyKey", normalizedKey);
-            details.put("existingConfigDigest", existing.getConfigDigest());
-            details.put("requestConfigDigest", configDigest);
-            throw new TrainingStateConflictException(
-                "IDEMPOTENCY_KEY_CONFLICT",
-                "Idempotency-Key has already been used for a different training configuration.",
-                details
-            );
-          }
-          Integer existingQueuePos = TrainingJobStatus.QUEUED.wireValue().equals(existing.getStatus())
-              ? queuePositionLocked(existing.getJobId())
-              : null;
-          return new TrainingStartResponse(
-              existing.getJobId(),
-              existing.getStatus(),
-              existing.getTotalEpochs(),
-              existing.getTotalBatches(),
-              streamUrl(existing.getJobId()),
-              existing.getConfigDigest(),
-              true,
-              existingQueuePos
-          );
+        TrainingStartResponse raceReplay =
+            findIdempotentReplayOrThrowConflictLocked(username, normalizedKey, configDigest);
+        if (raceReplay != null) {
+          return raceReplay;
         }
       }
 
@@ -348,6 +333,42 @@ public class TrainingJobService {
         configDigest,
         false,
         queuePosition
+    );
+  }
+
+  private TrainingStartResponse findIdempotentReplayOrThrowConflictLocked(
+      String username,
+      String normalizedKey,
+      String configDigest
+  ) {
+    TrainingJob existing = jobRepository.findByOwnerAndIdempotencyKey(username, normalizedKey).orElse(null);
+    if (existing == null) {
+      return null;
+    }
+    if (!Objects.equals(existing.getConfigDigest(), configDigest)) {
+      Map<String, Object> details = new LinkedHashMap<>();
+      details.put("jobId", existing.getJobId());
+      details.put("idempotencyKey", normalizedKey);
+      details.put("existingConfigDigest", existing.getConfigDigest());
+      details.put("requestConfigDigest", configDigest);
+      throw new TrainingStateConflictException(
+          "IDEMPOTENCY_KEY_CONFLICT",
+          "Idempotency-Key has already been used for a different training configuration.",
+          details
+      );
+    }
+    Integer existingQueuePos = TrainingJobStatus.QUEUED.wireValue().equals(existing.getStatus())
+        ? queuePositionLocked(existing.getJobId())
+        : null;
+    return new TrainingStartResponse(
+        existing.getJobId(),
+        existing.getStatus(),
+        existing.getTotalEpochs(),
+        existing.getTotalBatches(),
+        streamUrl(existing.getJobId()),
+        existing.getConfigDigest(),
+        true,
+        existingQueuePos
     );
   }
 
@@ -707,11 +728,43 @@ public class TrainingJobService {
   }
 
   public TrainingControlResponse save(String jobId) {
-    return save(requireRuntime(jobId));
+    ManagedJobRuntime runtime = runtimes.get(jobId);
+    if (runtime != null) {
+      return save(runtime);
+    }
+    TrainingJob entity = jobRepository.findById(jobId)
+        .orElseThrow(() -> new IllegalArgumentException("Training job not found."));
+    return saveFromPersistedJob(entity);
   }
 
   public TrainingControlResponse save(String username, String jobId) {
-    return save(requireOwnedRuntime(username, jobId));
+    requireUser(username);
+    ManagedJobRuntime runtime = runtimes.get(jobId);
+    if (runtime != null) {
+      if (runtime.owner() == null || !runtime.owner().equals(username)) {
+        throw new IllegalArgumentException("Training job not found.");
+      }
+      return save(runtime);
+    }
+    TrainingJob entity = jobRepository.findByJobIdAndOwner(jobId, username)
+        .orElseThrow(() -> new IllegalArgumentException("Training job not found."));
+    return saveFromPersistedJob(entity);
+  }
+
+  private TrainingControlResponse saveFromPersistedJob(TrainingJob entity) {
+    if (entity.getOwner() == null || entity.getOwner().isBlank()) {
+      throw new IllegalArgumentException("Please login before saving checkpoints.");
+    }
+    TrainingCheckpoint existing = checkpoints
+        .findFirstByJobIdAndUserUsernameOrderByCreatedAtDesc(entity.getJobId(), entity.getOwner())
+        .orElseThrow(() -> new IllegalArgumentException("Checkpoint can be saved after test set evaluation completes."));
+    return new TrainingControlResponse(
+        entity.getJobId(),
+        entity.getStatus(),
+        "Checkpoint saved: " + existing.getName(),
+        entity.getPendingControl(),
+        true
+    );
   }
 
   private TrainingControlResponse save(ManagedJobRuntime runtime) {
@@ -784,12 +837,42 @@ public class TrainingJobService {
   }
 
   public void addSession(String username, String jobId, WebSocketSession session) {
-    ManagedJobRuntime runtime = requireOwnedRuntime(username, jobId);
-    addSession(runtime, session);
+    requireUser(username);
+    ManagedJobRuntime runtime = runtimes.get(jobId);
+    if (runtime != null) {
+      if (runtime.owner() == null || !runtime.owner().equals(username)) {
+        throw new IllegalArgumentException("Training job not found.");
+      }
+      addSession(runtime, session);
+      return;
+    }
+    TrainingJob entity = jobRepository.findByJobIdAndOwner(jobId, username)
+        .orElseThrow(() -> new IllegalArgumentException("Training job not found."));
+    replayPersistedEventsToSession(entity.getJobId(), session);
   }
 
   public void addCollaborationObserverSession(String jobId, WebSocketSession session) {
-    addSession(requireRuntime(jobId), session);
+    ManagedJobRuntime runtime = runtimes.get(jobId);
+    if (runtime != null) {
+      addSession(runtime, session);
+      return;
+    }
+    TrainingJob entity = jobRepository.findById(jobId)
+        .orElseThrow(() -> new IllegalArgumentException("Training job not found."));
+    replayPersistedEventsToSession(entity.getJobId(), session);
+  }
+
+  private void replayPersistedEventsToSession(String jobId, WebSocketSession session) {
+    sessions.computeIfAbsent(jobId, ignored -> new CopyOnWriteArraySet<>()).add(session);
+    if (eventRepository == null) {
+      return;
+    }
+    List<TrainingJobEvent> rows = eventRepository.findByJobIdAndSequenceGreaterThanOrderBySequenceAsc(
+        jobId, 0L, PageRequest.of(0, properties.getMaxHistoryEvents())
+    );
+    for (TrainingJobEvent row : rows) {
+      sendRaw(session, row.getPayloadJson());
+    }
   }
 
   private void addSession(ManagedJobRuntime runtime, WebSocketSession session) {
@@ -825,6 +908,10 @@ public class TrainingJobService {
       }
     }
     return count;
+  }
+
+  int runtimeCountForTest() {
+    return runtimes.size();
   }
 
   @PreDestroy
@@ -1143,14 +1230,14 @@ public class TrainingJobService {
           }
           case "completed" -> {
             if (TrainingJobStateMachine.canTransition(current, TrainingJobStatus.COMPLETED)) {
-              transitionJobLocked(runtime, TrainingJobStatus.COMPLETED, 0, null, null);
+              transitionJobLocked(runtime, TrainingJobStatus.COMPLETED, null, null, null);
               releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
               scheduleTerminalProcessReaper(runtime, runGeneration, runtime.process());
             }
           }
           case "stopped" -> {
             if (TrainingJobStateMachine.canTransition(current, TrainingJobStatus.STOPPED)) {
-              transitionJobLocked(runtime, TrainingJobStatus.STOPPED, 0, null, null);
+              transitionJobLocked(runtime, TrainingJobStatus.STOPPED, null, null, null);
               releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
               scheduleTerminalProcessReaper(runtime, runGeneration, runtime.process());
             }
@@ -1182,6 +1269,9 @@ public class TrainingJobService {
       synchronized (schedulerLock) {
         if (runtime.isActiveRunGeneration(runGeneration)) {
           runtime.clearProcessReference(process);
+        }
+        if (runtime.statusEnum().isTerminal()) {
+          scheduleTerminalRuntimeEvictionLocked(runtime);
         }
       }
     }, delayMs, TimeUnit.MILLISECONDS);
@@ -1229,6 +1319,7 @@ public class TrainingJobService {
           if (activeSlotJobIds.contains(runtime.jobId())) {
             releaseSlotAndCollectNextLocked(runtime.jobId(), promoted);
           }
+          scheduleTerminalRuntimeEvictionLocked(runtime);
         } else if (exitCode == 0 && runtime.pendingControlEnum() == TrainingControlAction.STOP) {
           transitionJobLocked(runtime, TrainingJobStatus.STOPPED, 0, null, null);
           syntheticControlStatus = TrainingJobStatus.STOPPED.wireValue();
@@ -1304,9 +1395,57 @@ public class TrainingJobService {
     if (targetStatus.isTerminal()) {
       entity.setFinishedAt(now);
       runtime.cancelTimers();
+      scheduleTerminalRuntimeEvictionLocked(runtime);
     }
     jobRepository.saveAndFlush(entity);
     runtime.clearEntityDirtyLocked();
+  }
+
+  private void scheduleTerminalRuntimeEvictionLocked(ManagedJobRuntime runtime) {
+    if (shuttingDown) {
+      return;
+    }
+    Duration retention = properties.getTerminalRuntimeRetention();
+    if (retention == null || retention.isNegative()) {
+      return;
+    }
+    long delayMs = Math.max(1L, retention.toMillis());
+    ScheduledFuture<?> future = timerExecutor.schedule(
+        () -> evictTerminalRuntimeIfIdle(runtime),
+        delayMs,
+        TimeUnit.MILLISECONDS
+    );
+    runtime.setEvictionFuture(future);
+  }
+
+  private void evictTerminalRuntimeIfIdle(ManagedJobRuntime runtime) {
+    if (shuttingDown) {
+      return;
+    }
+    runtime.awaitPendingEventWrites();
+    synchronized (schedulerLock) {
+      if (shuttingDown
+          || runtimes.get(runtime.jobId()) != runtime
+          || !runtime.statusEnum().isTerminal()) {
+        return;
+      }
+      ManagedWorkerProcess proc = runtime.process();
+      if (proc != null && proc.isAlive()) {
+        return;
+      }
+      if (runtime.isEntityDirtyLocked()) {
+        jobRepository.saveAndFlush(runtime.entity());
+        runtime.clearEntityDirtyLocked();
+      }
+      runtimes.remove(runtime.jobId(), runtime);
+    }
+    CopyOnWriteArraySet<WebSocketSession> jobSessions = sessions.get(runtime.jobId());
+    if (jobSessions != null) {
+      jobSessions.removeIf(s -> !s.isOpen());
+      if (jobSessions.isEmpty()) {
+        sessions.remove(runtime.jobId(), jobSessions);
+      }
+    }
   }
 
   private void releaseSlotAndCollectNextLocked(String finishedJobId, List<ScheduledLaunch> promotedOut) {
@@ -2031,6 +2170,7 @@ public class TrainingJobService {
     private volatile ManagedWorkerProcess process;
     private volatile ScheduledFuture<?> jobTimeoutFuture;
     private volatile ScheduledFuture<?> stopTimeoutFuture;
+    private volatile ScheduledFuture<?> evictionFuture;
     private long remainingJobTimeoutNanos = -1L;
     private long activeRunStartedAtNanos = 0L;
     private boolean runningSegmentActive = false;
@@ -2232,6 +2372,11 @@ public class TrainingJobService {
       if (sf != null) {
         sf.cancel(false);
       }
+      ScheduledFuture<?> ef = evictionFuture;
+      evictionFuture = null;
+      if (ef != null) {
+        ef.cancel(false);
+      }
     }
 
     private void clearProcessReference(ManagedWorkerProcess candidate) {
@@ -2273,6 +2418,13 @@ public class TrainingJobService {
     private void setStopTimeoutFuture(ScheduledFuture<?> future) {
       ScheduledFuture<?> prev = this.stopTimeoutFuture;
       this.stopTimeoutFuture = future;
+      if (prev != null) {
+        prev.cancel(false);
+      }
+    }
+    private void setEvictionFuture(ScheduledFuture<?> future) {
+      ScheduledFuture<?> prev = this.evictionFuture;
+      this.evictionFuture = future;
       if (prev != null) {
         prev.cancel(false);
       }

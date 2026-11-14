@@ -17,6 +17,7 @@ public class TrainingProperties {
   private int maxQueueSize = 4;
   private Duration jobTimeout = Duration.ofMinutes(30);
   private Duration stopTimeout = Duration.ofSeconds(10);
+  private Duration terminalRuntimeRetention = Duration.ofMinutes(10);
   private int maxHistoryEvents = 240;
   private boolean releaseSlotOnPause = false;
 
@@ -51,6 +52,13 @@ public class TrainingProperties {
 
   public Duration getStopTimeout() { return stopTimeout == null ? Duration.ofSeconds(10) : stopTimeout; }
   public void setStopTimeout(Duration stopTimeout) { this.stopTimeout = stopTimeout; }
+
+  public Duration getTerminalRuntimeRetention() {
+    return terminalRuntimeRetention == null ? Duration.ofMinutes(10) : terminalRuntimeRetention;
+  }
+  public void setTerminalRuntimeRetention(Duration terminalRuntimeRetention) {
+    this.terminalRuntimeRetention = terminalRuntimeRetention;
+  }
 
   public int getMaxHistoryEvents() { return Math.max(1, maxHistoryEvents); }
   public void setMaxHistoryEvents(int maxHistoryEvents) { this.maxHistoryEvents = maxHistoryEvents; }
